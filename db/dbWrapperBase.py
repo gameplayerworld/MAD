@@ -7,6 +7,7 @@ from multiprocessing import Lock, Semaphore
 from typing import List, Optional
 
 import mysql
+from utils.s2Helper import S2Helper
 from bitstring import BitArray
 from mysql.connector.pooling import MySQLConnectionPool
 
@@ -42,7 +43,7 @@ class DbWrapperBase(ABC):
                                         **self.dbconfig)
         self.pool_mutex.release()
 
-    def _check_column_exists(self, table, column):
+    def check_column_exists(self, table, column):
         query = (
             "SELECT count(*) "
             "FROM information_schema.columns "
@@ -59,7 +60,7 @@ class DbWrapperBase(ABC):
         return int(self.execute(query, vals)[0][0])
 
     def _check_create_column(self, field):
-        if self._check_column_exists(field["table"], field["column"]) == 1:
+        if self.check_column_exists(field["table"], field["column"]) == 1:
             return
 
         alter_query = (
@@ -70,7 +71,7 @@ class DbWrapperBase(ABC):
 
         self.execute(alter_query, commit=True)
 
-        if self._check_column_exists(field["table"], field["column"]) == 1:
+        if self.check_column_exists(field["table"], field["column"]) == 1:
             logger.info("Successfully added '{}.{}' column",
                         field["table"], field["column"])
             return
@@ -368,7 +369,7 @@ class DbWrapperBase(ABC):
         pass
 
     @abstractmethod
-    def stop_from_db_without_quests(self, geofence_helper):
+    def stop_from_db_without_quests(self, geofence_helper, levelmode: bool = False):
         pass
 
     @abstractmethod
@@ -376,7 +377,15 @@ class DbWrapperBase(ABC):
         pass
 
     @abstractmethod
+    def get_stops_changed_since(self, timestamp):
+        pass
+
+    @abstractmethod
     def get_mon_changed_since(self, timestamp):
+        pass
+
+    @abstractmethod
+    def check_stop_quest_level(self, worker, latitude, longitude):
         pass
 
     @abstractmethod
@@ -399,6 +408,11 @@ class DbWrapperBase(ABC):
         It also handles a diff/old area to reduce returned data. Also checks for updated
         elements withing the rectangle via the timestamp.
         """
+        pass
+
+    @abstractmethod
+    def get_mons_in_rectangle(self, neLat, neLon, swLat, swLon,
+                              oNeLat=None, oNeLon=None, oSwLat=None, oSwLon=None, timestamp=None):
         pass
 
     def statistics_get_pokemon_count(self, days):
@@ -561,7 +575,6 @@ class DbWrapperBase(ABC):
         )
         vals = (str(ids), str(type))
         logger.debug(query)
-
 
         self.execute(query, vals, commit=True)
         return True
@@ -732,10 +745,15 @@ class DbWrapperBase(ABC):
     def get_detected_spawns(self, geofence_helper) -> List[Location]:
         logger.debug("DbWrapperBase::get_detected_spawns called")
 
+        minLat, minLon, maxLat, maxLon = geofence_helper.get_polygon_from_fence()
+
         query = (
             "SELECT latitude, longitude "
-            "FROM trs_spawn"
-        )
+            "FROM trs_spawn "
+            "WHERE (latitude >= {} AND longitude >= {} "
+            "AND latitude <= {} AND longitude <= {}) "
+        ).format(minLat, minLon, maxLat, maxLon)
+
         list_of_coords: List[Location] = []
         logger.debug(
             "DbWrapperBase::get_detected_spawns executing select query")
@@ -895,13 +913,14 @@ class DbWrapperBase(ABC):
         self.execute(query_trs_spawn, commit=True)
         self.execute(query_trs_spawnsightings, commit=True)
 
-    def download_spawns(self, neLat, neLon, swLat, swLon, oNeLat=None, oNeLon=None, oSwLat=None, oSwLon=None, timestamp=None):
+    def download_spawns(self, neLat, neLon, swLat, swLon, oNeLat=None, oNeLon=None,
+                        oSwLat=None, oSwLon=None, timestamp=None):
         logger.debug("dbWrapper::download_spawns")
         spawn = {}
 
         query = (
             "SELECT spawnpoint, latitude, longitude, calc_endminsec, "
-            "spawndef, last_scanned "
+            "spawndef, last_scanned, first_detection "
             "FROM `trs_spawn`"
         )
 
@@ -929,61 +948,40 @@ class DbWrapperBase(ABC):
         query = query + query_where
         res = self.execute(query)
 
-        for (spawnid, lat, lon, endtime, spawndef, last_scanned) in res:
-            spawn[spawnid] = {'id': spawnid, 'lat': lat, 'lon': lon, 'endtime': endtime, 'spawndef': spawndef,
-                              'lastscan': str(last_scanned)}
+        for (spawnid, lat, lon, endtime, spawndef, last_scanned, first_detection) in res:
+            spawn[spawnid] = {
+                'id': spawnid,
+                'lat': lat,
+                'lon': lon,
+                'endtime': endtime,
+                'spawndef': spawndef,
+                'lastscan': str(last_scanned),
+                'first_detection': str(first_detection)
+            }
 
         return str(json.dumps(spawn))
-
-    def get_spawntimes_of_spawn(self, spawn_ids: List[str]):
-        """
-        Retrieve a list of spawnpoints' spawntime for the given spawn_id
-        :param spawn_ids:
-        :return:
-        """
-        # TODO: this may not work...
-        query = (
-            "SELECT spawnpoint, spawndef, calc_endminsec "
-            "FROM trs_spawn "
-            "WHERE calc_endminsec IS NOT NULL and "
-            "spawnpoint = %s"
-            "DATE_FORMAT(STR_TO_DATE(calc_endminsec,'%i:%s'),'%i:%s') between DATE_FORMAT(DATE_ADD(NOW(), "
-            "INTERVAL if(spawndef=15,60,30) MINUTE),'%i:%s') and DATE_FORMAT(DATE_ADD(NOW(), "
-            "INTERVAL if(spawndef=15,70,40) MINUTE),'%i:%s') "
-        )
-        vals = (spawn_ids, )
-
-        results = self.executemany(query, vals)
-        spawntimes = {}
-        current_time_of_day = datetime.now().replace(microsecond=0)
-        for spawnpoint, spawndef, calc_endminsec in results:
-            endminsec_split = calc_endminsec.split(":")
-            minutes = int(endminsec_split[0])
-            seconds = int(endminsec_split[1])
-            temp_date = current_time_of_day.replace(
-                    minute=minutes, second=seconds)
-
-            spawn_duration_minutes = 60 if spawndef == 15 else 30
-
-            timestamp = time.mktime(temp_date.timetuple()) - spawn_duration_minutes * 60
-
-            spawntimes[spawnpoint] = timestamp
-        return spawntimes
 
     def retrieve_next_spawns(self, geofence_helper):
         """
         Retrieve the spawnpoints with their respective unixtimestamp that are due in the next 300 seconds
         :return:
         """
-        current_time_of_day = datetime.now().replace(microsecond=0)
 
         logger.debug("DbWrapperBase::retrieve_next_spawns called")
+
+        current_time_of_day = datetime.now().replace(microsecond=0)
+        minLat, minLon, maxLat, maxLon = geofence_helper.get_polygon_from_fence()
+
         query = (
-            "SELECT latitude, longitude, spawndef, calc_endminsec FROM trs_spawn WHERE calc_endminsec IS NOT NULL and "
-            "DATE_FORMAT(STR_TO_DATE(calc_endminsec,'%i:%s'),'%i:%s') between DATE_FORMAT(DATE_ADD(NOW(), "
-            "INTERVAL if(spawndef=15,60,30) MINUTE),'%i:%s') and DATE_FORMAT(DATE_ADD(NOW(), "
-            "INTERVAL if(spawndef=15,70,40) MINUTE),'%i:%s')"
-        )
+            "SELECT latitude, longitude, spawndef, calc_endminsec "
+            "FROM trs_spawn "
+            "WHERE calc_endminsec IS NOT NULL "
+            "AND (latitude >= {} AND longitude >= {} AND latitude <= {} AND longitude <= {}) "
+            "AND DATE_FORMAT(STR_TO_DATE(calc_endminsec,'%i:%s'),'%i:%s') BETWEEN DATE_FORMAT(DATE_ADD(NOW(), "
+            " INTERVAL if(spawndef=15,60,30) MINUTE),'%i:%s') "
+            "AND DATE_FORMAT(DATE_ADD(NOW(), INTERVAL if(spawndef=15,70,40) MINUTE),'%i:%s')"
+        ).format(minLat, minLon, maxLat, maxLon)
+
         res = self.execute(query)
         next_up = []
         current_time = time.time()
@@ -1295,8 +1293,7 @@ class DbWrapperBase(ABC):
     def statistics_get_quests_count(self, days):
         logger.debug('Fetching quests count from db')
         query_where = ''
-        query_date = "unix_timestamp(DATE_FORMAT(FROM_UNIXTIME(quest_timestamp), '%y-%m-%d %k:00:00')) * 1000 " \
-            "as Timestamp"
+        query_date = "unix_timestamp(DATE_FORMAT(FROM_UNIXTIME(quest_timestamp), '%y-%m-%d %k:00:00'))"
 
         if days:
             days = datetime.utcnow() - timedelta(days=days)
@@ -1305,7 +1302,7 @@ class DbWrapperBase(ABC):
 
         query = (
             "SELECT %s, count(GUID) as Count  FROM trs_quest %s "
-            "group by day(FROM_UNIXTIME(quest_timestamp)), hour(FROM_UNIXTIME(quest_timestamp))"
+            "group by day(FROM_UNIXTIME(quest_timestamp)), hour(FROM_UNIXTIME(quest_timestamp)) "
             "order by quest_timestamp" %
                 (str(query_date), str(query_where))
         )
@@ -1483,13 +1480,12 @@ class DbWrapperBase(ABC):
 
     def statistics_get_all_empty_scanns(self):
         logger.debug('Fetching all empty locations from db')
-        query =(
-            "SELECT count(b.id) as Count, b.lat, b.lng, GROUP_CONCAT(DISTINCT b.worker order by worker asc "
-            "SEPARATOR ', '), if(b.type=0,'Normal','PrioQ'), max(b.period), (select count(c.id) "
-            "from trs_stats_location_raw c where c.lat=b.lat and c.lng=b.lng and c.success=1) as successcount from "
-            "trs_stats_location_raw b where success=0 group by lat, lng HAVING Count > 5 and successcount=0 "
-            "ORDER BY count(id) DESC"
-        )
+        query = ("SELECT count(b.id) as Count, b.lat, b.lng, GROUP_CONCAT(DISTINCT b.worker order by worker asc "
+                 "SEPARATOR ', '), if(b.type=0,'Normal','PrioQ'), max(b.period), (select count(c.id) "
+                 "from trs_stats_location_raw c where c.lat=b.lat and c.lng=b.lng and c.success=1) as successcount from "
+                 "trs_stats_location_raw b where success=0 group by lat, lng HAVING Count > 5 and successcount=0 "
+                 "ORDER BY count(id) DESC"
+                 )
 
         res = self.execute(query)
         return res
@@ -1532,20 +1528,19 @@ class DbWrapperBase(ABC):
 
         query_date = "unix_timestamp(DATE_FORMAT(FROM_UNIXTIME(period), '%y-%m-%d %k:00:00'))"
 
-        query = (
-                "SELECT %s, lat, lng, if(type=0,'Normal',if(type=1,'PrioQ', if(type=2,'Startup',"
-                "if(type=3,'Reboot','Restart')))), if(success=1,'OK','NOK'), fix_ts, "
-                "if(data_ts=0,fix_ts,data_ts), count, if(transporttype=0,'Teleport',if(transporttype=1,'Walk', "
-                "'other')) from trs_stats_location_raw %s %s order by id asc" %
-                (str(query_date), (query_where), str(worker_where))
-        )
+        query = ("SELECT %s, lat, lng, if(type=0,'Normal',if(type=1,'PrioQ', if(type=2,'Startup',"
+                 "if(type=3,'Reboot','Restart')))), if(success=1,'OK','NOK'), fix_ts, "
+                 "if(data_ts=0,fix_ts,data_ts), count, if(transporttype=0,'Teleport',if(transporttype=1,'Walk', "
+                 "'other')) from trs_stats_location_raw %s %s order by id asc" %
+                 (str(query_date), (query_where), str(worker_where))
+                 )
 
         res = self.execute(query)
         return res
 
     def statistics_get_location_info(self):
         logger.debug('Fetching all empty locations from db')
-        query =(
+        query = (
             "select worker, sum(location_count), sum(location_ok), sum(location_nok), "
             "sum(location_nok) / sum(location_count) * 100 as Loc_fail_rate "
             "from trs_stats_location "
@@ -1576,3 +1571,64 @@ class DbWrapperBase(ABC):
             "delete from trs_stats_location_raw where period < (UNIX_TIMESTAMP() - 604800)"
         )
         self.execute(query, commit=True)
+
+    def submit_cells(self, origin: str, map_proto: dict):
+        cells = []
+        protocells = map_proto.get("cells", [])
+
+        query = ("INSERT INTO trs_s2cells (id, level, center_latitude, center_longitude, updated) "
+                 "VALUES (%s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE "
+                 "updated=VALUES(updated)"
+                 )
+
+        for cell in protocells:
+            cell_id = cell["id"]
+
+            if cell_id < 0:
+                cell_id = cell_id + 2 ** 64
+
+            lat, lng, alt = S2Helper.get_position_from_cell(cell_id)
+
+            cells.append((cell_id, 15, lat, lng, cell["current_timestamp"] / 1000))
+
+        self.executemany(query, cells, commit=True)
+
+    def get_cells_in_rectangle(self, neLat, neLon, swLat, swLon,
+                               oNeLat=None, oNeLon=None, oSwLat=None, oSwLon=None, timestamp=None):
+        query = (
+            "SELECT id, level, center_latitude, center_longitude, updated "
+            "FROM trs_s2cells "
+        )
+
+        query_where = (
+            " WHERE (center_latitude >= {} AND center_longitude >= {} "
+            " AND center_latitude <= {} AND center_longitude <= {}) "
+        ).format(swLat, swLon, neLat, neLon)
+
+        if oNeLat is not None and oNeLon is not None and oSwLat is not None and oSwLon is not None:
+            oquery_where = (
+                " AND NOT (center_latitude >= {} AND center_longitude >= {} "
+                " AND center_latitude <= {} AND center_longitude <= {}) "
+            ).format(oSwLat, oSwLon, oNeLat, oNeLon)
+
+            query_where = query_where + oquery_where
+
+        elif timestamp is not None:
+            tsdt = datetime.utcfromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M:%S")
+            oquery_where = " AND updated >= '{}' ".format(tsdt)
+
+            query_where = query_where + oquery_where
+
+        res = self.execute(query + query_where)
+
+        cells = []
+        for (id, level, center_latitude, center_longitude, updated) in res:
+            cells.append({
+                "id": id,
+                "level": level,
+                "center_latitude": center_latitude,
+                "center_longitude": center_longitude,
+                "updated": updated
+            })
+
+        return cells

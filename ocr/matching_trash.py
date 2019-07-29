@@ -38,9 +38,12 @@ def trash_image_matching(screen_img):
     if trash.mean() == 255 or trash.mean() == 0:
         return clicklist
 
-    if width <= 1080 and width > 720:
+    if width < 1080 and width > 720:
         sc_from = 0.5
         sc_till = 1
+    elif width == 1080:
+        sc_from = 0.5
+        sc_till = 0.9
     elif width == 720:
         sc_from = 0.5
         sc_till = 0.7
@@ -63,7 +66,7 @@ def trash_image_matching(screen_img):
         loc = np.where(res >= threshold)
         boxcount = 0
         for pt in zip(*loc[::-1]):
-            if pt[0] > width/4*3:
+            if pt[0] > width/4*3 and pt[1] < height/5*4:
                 x_coord = int(pt[0] + tW / 2)
                 y_coord = int(pt[1] + tH / 2)
 
@@ -99,4 +102,4 @@ if __name__ == '__main__':
     fort_id = 'raid1'
     fort_img_path = os.getcwd() + '/' + str(fort_id) + '.jpg'
     url_img_path = os.getcwd() + 'ocr/mon_img/ic_raid_egg_rare.png'
-    # print (trash_image_matching('screenshot_x96mini.png'))
+    # print (trash_image_matching('xxxxxxxx.jpg'))
