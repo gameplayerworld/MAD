@@ -6,7 +6,7 @@ class RouteManagerMon(RouteManagerBase):
     def _priority_queue_update_interval(self):
         return 180
 
-    def _get_coords_after_finish_route(self):
+    def _get_coords_after_finish_route(self) -> bool:
         self._init_route_queue()
         return True
 
@@ -15,15 +15,15 @@ class RouteManagerMon(RouteManagerBase):
                           nofile=False)
         self._init_route_queue()
 
-    def __init__(self, db_wrapper, coords, max_radius, max_coords_within_radius, path_to_include_geofence,
+    def __init__(self, db_wrapper, dbm, area_id, coords, max_radius, max_coords_within_radius, path_to_include_geofence,
                  path_to_exclude_geofence, routefile, mode=None, coords_spawns_known=False, init=False,
-                 name="unknown", settings=None):
-        RouteManagerBase.__init__(self, db_wrapper=db_wrapper, coords=coords, max_radius=max_radius,
+                 name="unknown", settings=None, joinqueue=None):
+        RouteManagerBase.__init__(self, db_wrapper=db_wrapper, dbm=dbm, area_id=area_id, coords=coords, max_radius=max_radius,
                                   max_coords_within_radius=max_coords_within_radius,
                                   path_to_include_geofence=path_to_include_geofence,
                                   path_to_exclude_geofence=path_to_exclude_geofence,
                                   routefile=routefile, init=init,
-                                  name=name, settings=settings, mode=mode
+                                  name=name, settings=settings, mode=mode, joinqueue=joinqueue
                                   )
         self.coords_spawns_known = coords_spawns_known
 
@@ -38,6 +38,7 @@ class RouteManagerMon(RouteManagerBase):
             logger.info("Reading unknown Spawnpoints from DB")
             coords = self.db_wrapper.get_undetected_spawns(
                 self.geofence_helper)
+        self._start_priority_queue()
         return coords
 
     def _cluster_priority_queue_criteria(self):
@@ -50,23 +51,23 @@ class RouteManagerMon(RouteManagerBase):
         self._manager_mutex.acquire()
         try:
             if not self._is_started:
-                logger.info("Starting routemanager {}", str(self.name))
-                self._start_priority_queue()
                 self._is_started = True
+                logger.info("Starting routemanager {}", str(self.name))
+                if not self.init: self._start_priority_queue()
+                self._start_check_routepools()
                 self._init_route_queue()
                 self._first_round_finished = False
         finally:
             self._manager_mutex.release()
+        return True
+
+    def _delete_coord_after_fetch(self) -> bool:
+        return False
 
     def _quit_route(self):
         logger.info('Shutdown Route {}', str(self.name))
-        if self._update_prio_queue_thread is not None:
-            self._stop_update_thread.set()
-            self._update_prio_queue_thread.join()
-            self._update_prio_queue_thread = None
-            self._stop_update_thread.clear()
         self._is_started = False
         self._round_started_time = None
 
-    def _check_coords_before_returning(self, lat, lng):
+    def _check_coords_before_returning(self, lat, lng, origin):
         return True

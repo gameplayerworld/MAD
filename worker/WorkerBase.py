@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from threading import Event, Lock, Thread, current_thread
 from typing import Optional
 
-from db.dbWrapperBase import DbWrapperBase
+from db.DbWrapper import DbWrapper
 from mitm_receiver.MitmMapper import MitmMapper
 from ocr.pogoWindows import PogoWindows
 from utils.MappingManager import MappingManager
@@ -22,13 +22,14 @@ from utils.madGlobals import (
 from utils.resolution import Resocalculator
 from utils.routeutil import check_walker_value_type
 from websocket.communicator import Communicator
+from ocr.screenPath import ScreenType, WordToScreenMatching
 
 Location = collections.namedtuple('Location', ['lat', 'lng'])
 
 
 class WorkerBase(ABC):
     def __init__(self, args, id, last_known_state, websocket_handler, mapping_manager: MappingManager,
-                 routemanager_name: str, db_wrapper: DbWrapperBase, pogoWindowManager: PogoWindows, NoOcr: bool = True,
+                 routemanager_name: str, db_wrapper: DbWrapper, pogoWindowManager: PogoWindows, NoOcr: bool = True,
                  walker=None):
         # self.thread_pool = ThreadPool(processes=2)
         self._mapping_manager: MappingManager = mapping_manager
@@ -62,7 +63,10 @@ class WorkerBase(ABC):
         self._pogoWindowManager = pogoWindowManager
         self._waittime_without_delays = 0
         self._transporttype = 0
-        self._not_injected_count = 0
+        self._not_injected_count: int = 0
+        self._same_screen_count: int = 0
+        self._last_screen_type: ScreenType = ScreenType.UNDEFINED
+        self._loginerrorcounter: int = 0
 
         self.current_location = Location(0.0, 0.0)
         self.last_location = self.get_devicesettings_value("last_location", None)
@@ -71,7 +75,7 @@ class WorkerBase(ABC):
             self.last_location = Location(0.0, 0.0)
 
         if self.get_devicesettings_value('last_mode', None) is not None and \
-                self.get_devicesettings_value('last_mode') in ("raids_mitm", "mon_mitm", "iv_mitm", "raids_ocr"):
+                self.get_devicesettings_value('last_mode') in ("raids_mitm", "mon_mitm", "iv_mitm"):
             # Reset last_location - no useless waiting delays (otherwise stop mode)
             logger.info('{}: last Mode not pokestop - reset saved location', str(self._id))
             self.last_location = Location(0.0, 0.0)
@@ -79,6 +83,8 @@ class WorkerBase(ABC):
         self.set_devicesettings_value("last_mode", self._mapping_manager.routemanager_get_mode(self._routemanager_name))
         self.last_processed_location = Location(0.0, 0.0)
         self.workerstart = None
+        self._WordToScreenMatching = WordToScreenMatching(self._communicator, self._pogoWindowManager, self._id,
+                                                          self._resocalc, mapping_manager, self._applicationArgs)
 
     def set_devicesettings_value(self, key: str, value):
         self._mapping_manager.set_devicesetting_value_of(self._id, key, value)
@@ -99,12 +105,20 @@ class WorkerBase(ABC):
     def get_communicator(self):
         return self._communicator
 
-    def get_screenshot_path(self) -> str:
+    def get_screenshot_path(self, fileaddon: bool = False) -> str:
         screenshot_ending: str = ".jpg"
+        addon: str = ""
         if self.get_devicesettings_value("screenshot_type", "jpeg") == "png":
             screenshot_ending = ".png"
 
-        screenshot_filename = "screenshot_{}{}".format(str(self._id), screenshot_ending)
+        if fileaddon:
+            addon: str = "_" + str(time.time())
+
+        screenshot_filename = "screenshot_{}{}{}".format(str(self._id), str(addon), screenshot_ending)
+
+        if fileaddon:
+            logger.info("Creating debugscreen: {}".format(screenshot_filename))
+
         return os.path.join(
                 self._applicationArgs.temp_path, screenshot_filename)
 
@@ -163,15 +177,6 @@ class WorkerBase(ABC):
         """
 
     @abstractmethod
-    def _start_pogo(self):
-        """
-        Routine to start pogo.
-        Return the state as a boolean do indicate a successful start
-        :return:
-        """
-        pass
-
-    @abstractmethod
     def _cleanup(self):
         """
         Cleanup any threads you started in derived classes etc
@@ -212,7 +217,10 @@ class WorkerBase(ABC):
         # do some other stuff in the main process
         while not self._stop_worker_event.isSet():
             time.sleep(1)
-        t_main_work.join()
+
+        while t_main_work.isAlive():
+            time.sleep(1)
+            t_main_work.join()
         logger.info("Worker {} stopped gracefully", str(self._id))
         # async_result.get()
         return self._last_known_state
@@ -227,23 +235,29 @@ class WorkerBase(ABC):
     def _internal_pre_work(self):
         current_thread().name = self._id
 
-        self._work_mutex.acquire()
+        if self.get_devicesettings_value("startcoords_of_walker", None) is not None:
+            startcoords = self.get_devicesettings_value("startcoords_of_walker").replace(' ', '')\
+                .replace('_','').split(',')
+            logger.info('Setting startcoords or walker lat {} / lng {}'.format(str(startcoords[0]),
+                                                                               str(startcoords[1])))
+            self._communicator.setLocation(startcoords[0], startcoords[1], 0)
+
+
         try:
-            self._check_ggl_login()
+            self._work_mutex.acquire()
             self._turn_screen_on_and_start_pogo()
             self._get_screen_size()
+            # register worker  in routemanager
+            logger.info("Try to register {} in Routemanager {}", str(
+                self._id), str(self._mapping_manager.routemanager_get_name(self._routemanager_name)))
+            self._mapping_manager.register_worker_to_routemanager(self._routemanager_name, self._id)
         except WebsocketWorkerRemovedException:
             logger.error("Timeout during init of worker {}", str(self._id))
             # no cleanup required here? TODO: signal websocket server somehow
             self._stop_worker_event.set()
             return
-
-        # register worker  in routemanager
-        logger.info("Try to register {} in Routemanager {}", str(
-                self._id), str(self._routemanager_name))
-        self._mapping_manager.register_worker_to_routemanager(self._routemanager_name, self._id)
-
-        self._work_mutex.release()
+        finally:
+            self._work_mutex.release()
 
         self._async_io_looper_thread = Thread(name=str(self._id) + '_asyncio_' + self._id,
                                               target=self._start_asyncio_loop)
@@ -256,45 +270,46 @@ class WorkerBase(ABC):
     def _internal_health_check(self):
         # check if pogo is topmost and start if necessary
         logger.debug(
-                "_internal_health_check: Calling _start_pogo routine to check if pogo is topmost")
-        self._work_mutex.acquire()
-        logger.debug("_internal_health_check: worker lock acquired")
-        logger.debug("Checking if we need to restart pogo")
-        # Restart pogo every now and then...
-        restart_pogo_setting = self.get_devicesettings_value("restart_pogo", 80)
-        if restart_pogo_setting > 0:
-            # logger.debug("main: Current time - lastPogoRestart: {}", str(curTime - lastPogoRestart))
-            # if curTime - lastPogoRestart >= (args.restart_pogo * 60):
-            if self._location_count > restart_pogo_setting:
-                logger.error(
-                        "scanned " + str(restart_pogo_setting) + " locations, restarting pogo")
-                pogo_started = self._restart_pogo()
-                self._location_count = 0
+            "_internal_health_check: Calling _start_pogo routine to check if pogo is topmost")
+        try:
+            self._work_mutex.acquire()
+            logger.debug("_internal_health_check: worker lock acquired")
+            logger.debug("Checking if we need to restart pogo")
+            # Restart pogo every now and then...
+            restart_pogo_setting = self.get_devicesettings_value("restart_pogo", 0)
+            if restart_pogo_setting > 0:
+                # logger.debug("main: Current time - lastPogoRestart: {}", str(curTime - lastPogoRestart))
+                # if curTime - lastPogoRestart >= (args.restart_pogo * 60):
+                if self._location_count > restart_pogo_setting:
+                    logger.info(
+                        "scanned {} locations, restarting game on {}", str(restart_pogo_setting), str(self._id))
+                    pogo_started = self._restart_pogo()
+                    self._location_count = 0
+                else:
+                    pogo_started = self._start_pogo()
             else:
                 pogo_started = self._start_pogo()
-        else:
-            pogo_started = self._start_pogo()
-
-        self._work_mutex.release()
+        finally:
+            self._work_mutex.release()
         logger.debug("_internal_health_check: worker lock released")
         return pogo_started
 
     def _internal_cleanup(self):
         # set the event just to make sure - in case of exceptions for example
         self._stop_worker_event.set()
+        self._mapping_manager.unregister_worker_from_routemanager(self._routemanager_name, self._id)
         logger.info("Internal cleanup of {} started", str(self._id))
         self._cleanup()
         logger.info(
-                "Internal cleanup of {} signalling end to websocketserver", str(self._id))
-        self._mapping_manager.unregister_worker_from_routemanager(self._routemanager_name, self._id)
-        self._communicator.cleanup_websocket()
+            "Internal cleanup of {} signalling end to websocketserver", str(self._id))
 
-        logger.info("Stopped Route")
-        # self.stop_worker()
         if self._async_io_looper_thread is not None:
             logger.info("Stopping worker's asyncio loop")
             self.loop.call_soon_threadsafe(self.loop.stop)
             self._async_io_looper_thread.join()
+            time.sleep(10)
+
+        self._communicator.cleanup_websocket()
 
         logger.info("Internal cleanup of {} finished", str(self._id))
 
@@ -304,20 +319,18 @@ class WorkerBase(ABC):
             self._internal_pre_work()
         except (InternalStopWorkerException, WebsocketWorkerRemovedException, WebsocketWorkerTimeoutException):
             logger.error(
-                    "Failed initializing worker {}, connection terminated exceptionally", str(self._id))
+                "Failed initializing worker {}, connection terminated exceptionally", str(self._id))
             self._internal_cleanup()
             return
 
         if not self.check_max_walkers_reached():
             logger.warning('Max. Walkers in Area {} - closing connections',
-                           str(self._routemanager_name))
+                           str(self._mapping_manager.routemanager_get_name(self._routemanager_name)))
             self.set_devicesettings_value('finished', True)
             self._internal_cleanup()
             return
 
         while not self._stop_worker_event.isSet():
-            # check for ggl login
-            self._check_ggl_login()
             try:
                 # TODO: consider getting results of health checks and aborting the entire worker?
                 walkercheck = self.check_walker()
@@ -326,7 +339,7 @@ class WorkerBase(ABC):
                     break
             except (InternalStopWorkerException, WebsocketWorkerRemovedException, WebsocketWorkerTimeoutException):
                 logger.warning(
-                        "Worker {} killed by walker settings", str(self._id))
+                    "Worker {} killed by walker settings", str(self._id))
                 break
 
             try:
@@ -503,6 +516,9 @@ class WorkerBase(ABC):
                         str(self._geofix_sleeptime))
             time.sleep(int(self._geofix_sleeptime))
             self._geofix_sleeptime = 0
+
+        self._check_for_mad_job()
+
         self.current_location = self._mapping_manager.routemanager_get_next_location(self._routemanager_name, self._id)
         return self._mapping_manager.routemanager_get_settings(self._routemanager_name)
 
@@ -514,6 +530,13 @@ class WorkerBase(ABC):
                 while not self._restart_pogo():
                     logger.warning("failed starting pogo")
                     # TODO: stop after X attempts
+
+    def _check_for_mad_job(self):
+        if self.get_devicesettings_value("job", False):
+            logger.info("Worker {} get a job - waiting".format(str(self._id)))
+            while self.get_devicesettings_value("job", False) and not self._stop_worker_event.is_set():
+                time.sleep(10)
+            logger.info("Worker {} processed the job and go on ".format(str(self._id)))
 
     def _check_location_is_valid(self):
         if self.current_location is None:
@@ -541,37 +564,200 @@ class WorkerBase(ABC):
             self._communicator.turnScreenOn()
             time.sleep(self.get_devicesettings_value("post_turn_screen_on_delay", 2))
 
-    def _check_ggl_login(self):
-        topmostapp = self._communicator.topmostApp()
-        if not topmostapp: return False
+    def _check_windows(self):
+        logger.info('Checking pogo screen...')
 
-        if "AccountPickerActivity" in topmostapp or 'SignInActivity' in topmostapp:
+        returncode: ScreenType = ScreenType.UNDEFINED
 
-            if not self._takeScreenshot(delayBefore=self.get_devicesettings_value("post_screenshot_delay", 1),
-                                        delayAfter=10):
-                logger.error("_check_ggl_login: Failed getting screenshot")
-                return False
+        while not returncode == ScreenType.POGO and not self._stop_worker_event.is_set():
+            returncode = self._WordToScreenMatching.matchScreen()
 
-            logger.info('GGL Login Window found on {} - processing', str(self._id))
-            if not self._pogoWindowManager.look_for_ggl_login(self.get_screenshot_path(), self._communicator):
-                logger.error("_check_ggl_login: Failed reading screenshot")
-                return False
+            if returncode != ScreenType.POGO:
 
-            buttontimeout = 0
-            logger.info('Waiting for News Popup ...')
+                if (returncode not in (ScreenType.UNDEFINED, ScreenType.ERROR,
+                                                   ScreenType.PERMISSION)) \
+                        and self._last_screen_type == returncode \
+                        and self._same_screen_count == 3:
+                    logger.warning('Gamefreezed - restarting device')
+                    self._reboot()
+                    break
 
-            buttoncheck = self._checkPogoButton()
-            while not buttoncheck and not self._stop_worker_event.isSet() and buttontimeout < 6:
-                time.sleep(5)
-                buttoncheck = self._checkPogoButton()
-                buttontimeout += 1
-                if buttontimeout == 5:
-                    logger.info('Timeout while waiting for Button')
+                if (returncode not in (ScreenType.UNDEFINED, ScreenType.ERROR,
+                                                   ScreenType.PERMISSION)) \
+                        and self._last_screen_type == returncode \
+                        and self._same_screen_count < 3:
+                    self._same_screen_count += 1
+                    logger.warning('Getting same screen again - maybe Pogo freeze?')
 
+                if returncode == ScreenType.BLACK:
+                    logger.info("Found Black Loading Screen - waiting ...")
+                    time.sleep(20)
+
+                if returncode == ScreenType.GAMEDATA or returncode == ScreenType.CONSENT:
+                    logger.warning('Error getting Gamedata or strange ggl message appears')
+                    self._loginerrorcounter += 1
+                    self._restart_pogo(True)
+
+                elif returncode == ScreenType.CLOSE:
+                    logger.warning('Pogo not in foreground...')
+                    self._restart_pogo(True)
+
+                elif returncode == ScreenType.DISABLED:
+                    # Screendetection is disabled
+                    break
+
+                elif returncode == ScreenType.UPDATE:
+                    logger.error('Found update pogo screen - wait for update action')
+                    # update pogo - later with new rgc version
+                    while not self._stop_worker_event.is_set():
+                        time.sleep(10)
+
+                elif returncode == ScreenType.ERROR or returncode == ScreenType.FAILURE:
+                    logger.warning('Something wrong with screendetection or pogo failure screen')
+                    self._loginerrorcounter += 1
+
+                elif returncode == ScreenType.GPS:
+                    logger.warning("Detected GPS error 11 - rebooting device")
+                    self._reboot()
+
+                elif returncode == ScreenType.SN:
+                    logger.warning('Getting SN Screen - reset Magisk Settings')
+                    time.sleep(3)
+                    self._stop_pogo()
+                    self._communicator.magisk_off("com.nianticlabs.pokemongo")
+                    self._communicator.clearAppCache("com.nianticlabs.pokemongo")
+                    time.sleep(1)
+                    self._communicator.magisk_on("com.nianticlabs.pokemongo")
+                    time.sleep(1)
+                    self._reboot()
+                    break
+
+                if self._loginerrorcounter == 2:
+                    logger.error('Could not login again - (clearing game data + restarting device')
+                    self._stop_pogo()
+                    self._communicator.clearAppCache("com.nianticlabs.pokemongo")
+                    if self.get_devicesettings_value('clear_game_data', False):
+                        logger.info('Clearing game data')
+                        self._communicator.resetAppdata("com.nianticlabs.pokemongo")
+                    self._reboot()
+                    break
+
+                self._last_screen_type = returncode
+
+        logger.info('Checking pogo screen is finished')
+        return True
+
+    def _switch_user(self):
+        logger.info('Switching User - please wait ...')
+        self._stop_pogo()
+        time.sleep(5)
+        self._communicator.resetAppdata("com.nianticlabs.pokemongo")
+        self._turn_screen_on_and_start_pogo()
+        if not self._check_windows():
+            logger.error('Kill Worker...')
+            self._stop_worker_event.set()
+            return False
+        logger.info('Switching finished ...')
+        return True
+
+    def trigger_check_research(self):
+        if "pokestops" in self._valid_modes():
+            logger.warning("Cannot check for research menu while pokestops mode")
+            return
+        reached_main_menu = self._check_pogo_main_screen(3, True)
+        if reached_main_menu:
+            self._check_quest()
+            time.sleep(2)
+        return
+
+    def _check_quest(self):
+        logger.info('Precheck Quest Menu')
+        questcounter: int = 0
+        questloop: int = 0
+        firstround: bool = True
+        x, y = self._resocalc.get_coords_quest_menu(self)[0], \
+               self._resocalc.get_coords_quest_menu(self)[1]
+        self._communicator.click(int(x), int(y))
+        time.sleep(10)
+        returncode: ScreenType = ScreenType.UNDEFINED
+        if not self._takeScreenshot(delayBefore=self.get_devicesettings_value("post_screenshot_delay", 1),
+                                    delayAfter=2):
+            logger.error("_check_windows: Failed getting screenshot")
+            return False
+
+        while not returncode == ScreenType.POGO and not self._stop_worker_event.isSet():
+            returncode = self._WordToScreenMatching.checkQuest(self.get_screenshot_path())
+
+            if returncode == ScreenType.QUEST:
+                questcounter += 1
+                if firstround:
+                    logger.info('First round getting research menu')
+                    x, y = self._resocalc.get_close_main_button_coords(self)[0], \
+                           self._resocalc.get_close_main_button_coords(self)[1]
+                    self._communicator.click(int(x), int(y))
+                    time.sleep(1.5)
+                    return ScreenType.POGO
+                elif questcounter >= 2:
+                    logger.info('Getting research menu two times in row')
+                    x, y = self._resocalc.get_close_main_button_coords(self)[0], \
+                           self._resocalc.get_close_main_button_coords(self)[1]
+                    self._communicator.click(int(x), int(y))
+                    time.sleep(1.5)
+                    return ScreenType.POGO
+
+            x, y = self._resocalc.get_close_main_button_coords(self)[0], \
+                   self._resocalc.get_close_main_button_coords(self)[1]
+            self._communicator.click(int(x), int(y))
+            time.sleep(1.5)
+            x, y = self._resocalc.get_coords_quest_menu(self)[0], \
+                   self._resocalc.get_coords_quest_menu(self)[1]
+            self._communicator.click(int(x), int(y))
+            time.sleep(5)
+            self._takeScreenshot(delayBefore=self.get_devicesettings_value("post_screenshot_delay", 1),
+                                 delayAfter=2)
+            if questloop > 5:
+                logger.warning("Give up - maybe research screen is there...")
+                return ScreenType.POGO
+                break
+            questloop += 1
+            firstround = False
+
+        return
+
+    def _start_pogo(self):
+        """
+        Routine to start pogo.
+        Return the state as a boolean do indicate a successful start
+        :return:
+        """
+        pogo_topmost = self._communicator.isPogoTopmost()
+        if pogo_topmost:
             return True
 
-        logger.debug('No GGL Login Window found on {}', str(self._id))
-        return False
+        if not self._communicator.isScreenOn():
+            self._communicator.startApp("de.grennith.rgc.remotegpscontroller")
+            logger.warning("Turning screen on")
+            self._communicator.turnScreenOn()
+            time.sleep(self.get_devicesettings_value("post_turn_screen_on_delay", 7))
+
+        cur_time = time.time()
+        start_result = False
+        self._mitm_mapper.set_injection_status(self._id, False)
+        while not pogo_topmost:
+            start_result = self._communicator.startApp(
+                "com.nianticlabs.pokemongo")
+            time.sleep(1)
+            pogo_topmost = self._communicator.isPogoTopmost()
+
+        if start_result:
+            logger.warning("startPogo: Started pogo successfully...")
+            self._last_known_state["lastPogoRestart"] = cur_time
+
+        self._wait_pogo_start_delay()
+        if not self._wait_for_injection() or self._stop_worker_event.is_set():
+            raise InternalStopWorkerException
+
+        return start_result
 
     def _stop_pogo(self):
         attempts = 0
@@ -588,21 +774,18 @@ class WorkerBase(ABC):
         return stop_result
 
     def _reboot(self, mitm_mapper: Optional[MitmMapper] = None):
-        if not self.get_devicesettings_value("reboot", True):
-            logger.warning("Reboot command to be issued to device but reboot is disabled. Skipping reboot")
-            return True
         try:
             start_result = self._communicator.reboot()
         except WebsocketWorkerRemovedException:
             logger.error(
-                    "Could not reboot due to client already having disconnected")
+                    "Could not reboot due to client already disconnected")
             start_result = False
         time.sleep(5)
         if mitm_mapper is not None:
             mitm_mapper.collect_location_stats(self._id, self.current_location, 1, time.time(), 3, 0,
                                                self._mapping_manager.routemanager_get_mode(self._routemanager_name),
                                                99)
-        self._db_wrapper.save_last_reboot(self._id)
+        self._db_wrapper.save_last_reboot(self._applicationArgs.status_name, self._id)
         self.stop_worker()
         return start_result
 
@@ -617,8 +800,8 @@ class WorkerBase(ABC):
 
     def _restart_pogo(self, clear_cache=True, mitm_mapper: Optional[MitmMapper] = None):
         successful_stop = self._stop_pogo()
-        self._db_wrapper.save_last_restart(self._id)
-        logger.debug("restartPogo: stop pogo resulted in {}",
+        self._db_wrapper.save_last_restart(self._applicationArgs.status_name, self._id)
+        logger.debug("restartPogo: stop game resulted in {}",
                      str(successful_stop))
         if successful_stop:
             if clear_cache:
@@ -636,7 +819,7 @@ class WorkerBase(ABC):
         successfulStop = self._stopPogoDroid()
         time.sleep(1)
         logger.debug(
-                "restartPogoDroid: stop pogodriud resulted in {}", str(successfulStop))
+                "restartPogoDroid: stop PogoDroid resulted in {}", str(successfulStop))
         if successfulStop:
             return self._start_pogodroid()
         else:
@@ -676,7 +859,7 @@ class WorkerBase(ABC):
 
         return trashes
 
-    def _takeScreenshot(self, delayAfter=0.0, delayBefore=0.0):
+    def _takeScreenshot(self, delayAfter=0.0, delayBefore=0.0, errorscreen: bool = False):
         logger.debug("Taking screenshot...")
         time.sleep(delayBefore)
         compareToTime = time.time() - self._lastScreenshotTaken
@@ -690,11 +873,11 @@ class WorkerBase(ABC):
 
         screenshot_quality: int = self.get_devicesettings_value("screenshot_quality", 80)
 
-        take_screenshot = self._communicator.get_screenshot(self.get_screenshot_path(),
+        take_screenshot = self._communicator.get_screenshot(self.get_screenshot_path(fileaddon=errorscreen),
                                                             screenshot_quality, screenshot_type)
 
         if self._lastScreenshotTaken and compareToTime < 0.5:
-            logger.debug(
+            logger.error(
                     "takeScreenshot: screenshot taken recently, returning immediately")
             logger.debug("Screenshot taken recently, skipping")
             return True
@@ -721,7 +904,7 @@ class WorkerBase(ABC):
         logger.debug("checkPogoFreeze: New Hash: {}", str(screenHash))
         if hamming_dist(str(self._lastScreenHash), str(screenHash)) < 4 and str(self._lastScreenHash) != '0':
             logger.debug(
-                    "checkPogoFreeze: New und old Screenshoot are the same - no processing")
+                    "checkPogoFreeze: New and old Screenshoot are the same - no processing")
             self._lastScreenHashCount += 1
             logger.debug("checkPogoFreeze: Same Screen Count: " +
                          str(self._lastScreenHashCount))
@@ -755,31 +938,26 @@ class WorkerBase(ABC):
             return False
 
         logger.debug("_check_pogo_main_screen: checking mainscreen")
-        buttoncheck = self._pogoWindowManager.look_for_button(screenshot_path, 2.20, 3.01, self._communicator)
-        if buttoncheck:
-            logger.debug('Found button on screen')
-            self._takeScreenshot(delayBefore=self.get_devicesettings_value("post_screenshot_delay", 1))
         while not self._pogoWindowManager.check_pogo_mainscreen(screenshot_path, self._id):
-            logger.error("_check_pogo_main_screen: not on Mainscreen...")
+            logger.warning("_check_pogo_main_screen: not on Mainscreen...")
             if attempts == maxAttempts:
                 # could not reach raidtab in given maxAttempts
                 logger.error(
                         "_check_pogo_main_screen: Could not get to Mainscreen within {} attempts", str(maxAttempts))
                 return False
 
-            # not using continue since we need to get a screen before the next round...
-            found = self._pogoWindowManager.look_for_button(screenshot_path, 2.20, 3.01, self._communicator)
+            found = self._pogoWindowManager.check_close_except_nearby_button(self.get_screenshot_path(), self._id,
+                                                                             self._communicator, close_raid=True)
             if found:
-                logger.debug("_check_pogo_main_screen: Found button (small)")
-
-            if not found and self._pogoWindowManager.check_close_except_nearby_button(
-                    self.get_screenshot_path(), self._id,
-                    self._communicator, close_raid=True):
                 logger.debug("_check_pogo_main_screen: Found (X) button (except nearby)")
+
+            if not found and self._pogoWindowManager.look_for_button(screenshot_path, 2.20, 3.01, self._communicator):
+                logger.debug("_check_pogo_main_screen: Found button (small)")
                 found = True
 
             if not found and self._pogoWindowManager.look_for_button(screenshot_path, 1.05, 2.20, self._communicator):
                 logger.debug("_check_pogo_main_screen: Found button (big)")
+                time.sleep(5)
                 found = True
 
             logger.debug("_check_pogo_main_screen: Previous checks found popups: {}", str(found))
@@ -788,6 +966,29 @@ class WorkerBase(ABC):
 
             attempts += 1
         logger.debug("_check_pogo_main_screen: done")
+        return True
+
+    def _check_pogo_main_screen_tr(self):
+        logger.debug(
+                "_check_pogo_main_screen_tr: Trying to get to the Mainscreen ")
+        pogoTopmost = self._communicator.isPogoTopmost()
+        if not pogoTopmost:
+            return False
+
+        if not self._takeScreenshot(delayBefore=self.get_devicesettings_value("post_screenshot_delay", 1)):
+                return False
+
+        screenshot_path = self.get_screenshot_path()
+        if os.path.isdir(screenshot_path):
+            logger.error(
+                    "_check_pogo_main_screen_tr: screenshot.png/.jpg is not a file/corrupted")
+            return False
+
+        logger.debug("_check_pogo_main_screen_tr: checking mainscreen")
+        if not self._pogoWindowManager.check_pogo_mainscreen(screenshot_path, self._id):
+            return False
+
+        logger.debug("_check_pogo_main_screen_tr: done")
         return True
 
     def _checkPogoButton(self):
@@ -815,10 +1016,14 @@ class WorkerBase(ABC):
         if found:
             time.sleep(1)
             logger.debug("checkPogoButton: Found button (small)")
-            logger.debug("checkPogoButton: done")
-            return True
+
+        if not found and self._pogoWindowManager.look_for_button(self.get_screenshot_path(), 1.05, 2.20,
+                                                                 self._communicator):
+            logger.debug("checkPogoButton: Found button (big)")
+            found = True
+
         logger.debug("checkPogoButton: done")
-        return False
+        return found
 
     def _wait_pogo_start_delay(self):
         delay_count: int = 0
@@ -833,21 +1038,16 @@ class WorkerBase(ABC):
             time.sleep(1)
             delay_count += 1
 
-    def _checkPogoClose(self):
+    def _checkPogoClose(self, takescreen = True):
         logger.debug("checkPogoClose: Trying to find closeX")
         pogoTopmost = self._communicator.isPogoTopmost()
         if not pogoTopmost:
             return False
 
-        if not self._takeScreenshot(delayBefore=self.get_devicesettings_value("post_screenshot_delay", 1)):
-            # TODO: go again?
-            # if again:
-            #     logger.error("checkPogoClose: failed getting a screenshot again")
-            #     return False
-            # TODO: consider throwing?
-            logger.debug("checkPogoClose: Could not get screenshot")
-            return False
-        attempts = 0
+        if takescreen:
+            if not self._takeScreenshot(delayBefore=self.get_devicesettings_value("post_screenshot_delay", 1)):
+                logger.debug("checkPogoClose: Could not get screenshot")
+                return False
 
         if os.path.isdir(self.get_screenshot_path()):
             logger.error("checkPogoClose: screenshot.png is not a file/corrupted")

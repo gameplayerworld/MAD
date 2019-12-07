@@ -1,6 +1,6 @@
 import sys
 py_version = sys.version_info
-if py_version.major < 3 or (py_version.major < 3 and py_version.minor < 6):
+if py_version.major < 3 or (py_version.major == 3 and py_version.minor < 6):
     print("MAD requires at least python 3.6! Your version: {}.{}"
           .format(py_version.major, py_version.minor))
     sys.exit(1)
@@ -12,8 +12,8 @@ from utils.MappingManager import MappingManager, MappingManagerManager
 import calendar
 import datetime
 import gc
-import glob
 import os
+import pkg_resources
 import time
 from threading import Thread, active_count
 
@@ -27,8 +27,10 @@ from utils.madGlobals import terminate_mad
 from utils.rarity import Rarity
 from utils.version import MADVersion
 from utils.walkerArgs import parseArgs
-from watchdog.observers import Observer
+import utils.data_manager
 from websocket.WebsocketServer import WebsocketServer
+from utils.updater import deviceUpdater
+from utils.functions import generate_mappingjson
 
 args = parseArgs()
 os.environ['LANGUAGE'] = args.language
@@ -53,59 +55,23 @@ def install_thread_excepthook():
             run_thread_old(*args, **kwargs)
         except (KeyboardInterrupt, SystemExit):
             raise
+        except BrokenPipeError:
+            pass
         except Exception:
-            exc_type, exc_value, exc_trace = sys.exc_info()
-            print(repr(sys.exc_info()))
-
-            # Handle Flask's broken pipe when a client prematurely ends
-            # the connection.
-            if str(exc_value) == '[Errno 32] Broken pipe':
-                pass
-            else:
-                logger.critical(
-                    'Unhandled patched exception ({}): "{}".', exc_type, exc_value)
-                sys.excepthook(exc_type, exc_value, exc_trace)
+            logger.opt(exception=True).critical("An unhandled exception occured!")
 
     def run_process(*args, **kwargs):
         try:
             run_process_old(*args, **kwargs)
         except (KeyboardInterrupt, SystemExit):
             raise
+        except BrokenPipeError:
+            pass
         except Exception:
-            exc_type, exc_value, exc_trace = sys.exc_info()
-            print(repr(sys.exc_info()))
+            logger.opt(exception=True).critical("An unhandled exception occured!")
 
-            # Handle Flask's broken pipe when a client prematurely ends
-            # the connection.
-            if str(exc_value) == '[Errno 32] Broken pipe':
-                pass
-            else:
-                logger.critical(
-                    'Unhandled patched exception ({}): "{}".', exc_type, exc_value)
-                sys.excepthook(exc_type, exc_value, exc_trace)
     Thread.run = run_thread
     Process.run = run_process
-
-
-def start_ocr_observer(args, db_helper):
-    from ocr.fileObserver import checkScreenshot
-    observer = Observer()
-    observer.schedule(checkScreenshot(args, db_helper),
-                      path=args.raidscreen_path)
-    observer.start()
-
-
-def generate_mappingjson():
-    import json
-    newfile = {}
-    newfile['areas'] = []
-    newfile['auth'] = []
-    newfile['devices'] = []
-    newfile['walker'] = []
-    newfile['devicesettings'] = []
-    with open(args.mappings, 'w') as outfile:
-        json.dump(newfile, outfile, indent=4, sort_keys=True)
-
 
 def find_referring_graphs(obj):
     REFERRERS_TO_IGNORE = [locals(), globals(), gc.garbage]
@@ -126,6 +92,7 @@ def get_system_infos(db_wrapper):
     pid = os.getpid()
     py = psutil.Process(pid)
     gc.set_threshold(5, 1, 1)
+    gc.enable()
 
     while not terminate_mad.is_set():
         logger.debug('Starting internal Cleanup')
@@ -165,35 +132,45 @@ def create_folder(folder):
         os.makedirs(folder)
 
 
+def check_dependencies():
+    with open("requirements.txt", "r") as f:
+        deps = f.readlines()
+        try:
+            pkg_resources.require(deps)
+        except pkg_resources.VersionConflict as version_error:
+            logger.error("Some dependencies aren't met. Required: {} (Installed: {})", version_error.req, version_error.dist)
+            sys.exit(1)
+
+
 if __name__ == "__main__":
+    check_dependencies()
+
+    if not os.path.exists(args.mappings):
+        logger.error("Couldn't find configuration file. Please run 'configmode.py' instead, if this is the first time starting MAD.")
+        sys.exit(1)
+
     # TODO: globally destroy all threads upon sys.exit() for example
     install_thread_excepthook()
 
-    db_wrapper, db_wrapper_manager = DbFactory.get_wrapper(args)
-    db_wrapper.create_hash_database_if_not_exists()
-    db_wrapper.check_and_create_spawn_tables()
-    db_wrapper.create_quest_database_if_not_exists()
-    db_wrapper.create_status_database_if_not_exists()
-    db_wrapper.create_usage_database_if_not_exists()
-    db_wrapper.create_statistics_databases_if_not_exists()
+    db_wrapper, db_pool_manager = DbFactory.get_wrapper(args)
     version = MADVersion(args, db_wrapper)
     version.get_version()
-
-    if args.clean_hash_database:
-        logger.info('Cleanup Hash Database and www_hash folder')
-        db_wrapper.delete_hash_table('999', '')
-        for file in glob.glob("ocr/www_hash/*.jpg"):
-            os.remove(file)
-        sys.exit(0)
 
     # create folders
     create_folder(args.raidscreen_path)
     create_folder(args.file_path)
+    create_folder(args.upload_path)
 
-    if not args.only_scan and not args.only_ocr and not args.only_routes:
+    if args.only_ocr:
+        logger.error(
+            "OCR scanning support has been dropped. Please get PogoDroid "
+            "and scan using MITM methods."
+        )
+        sys.exit(1)
+
+    if not args.only_scan and not args.only_routes:
         logger.error("No runmode selected. \nAllowed modes:\n"
                      " -os    ---- start scanner/devicecontroller\n"
-                     " -oo    ---- start OCR analysis of screenshots\n"
                      " -or    ---- only calculate routes")
         sys.exit(1)
 
@@ -208,11 +185,13 @@ if __name__ == "__main__":
     t_file_watcher = None
     t_whw = None
 
+    data_manager = utils.data_manager.DataManager(args)
+
     if args.only_scan or args.only_routes:
         MappingManagerManager.register('MappingManager', MappingManager)
         mapping_manager_manager = MappingManagerManager()
         mapping_manager_manager.start()
-        mapping_manager: MappingManager = mapping_manager_manager.MappingManager(db_wrapper, args, False)
+        mapping_manager: MappingManager = mapping_manager_manager.MappingManager(db_wrapper, args, data_manager, False)
         filename = args.mappings
         if not os.path.exists(filename):
             logger.error(
@@ -231,29 +210,27 @@ if __name__ == "__main__":
                 sys.exit(0)
 
             pogoWindowManager = None
+            jobstatus: dict = {}
             MitmMapperManager.register('MitmMapper', MitmMapper)
             mitm_mapper_manager = MitmMapperManager()
             mitm_mapper_manager.start()
-            mitm_mapper: MitmMapper = mitm_mapper_manager.MitmMapper(mapping_manager, db_wrapper)
-            ocr_enabled = False
+            mitm_mapper: MitmMapper = mitm_mapper_manager.MitmMapper(mapping_manager, db_wrapper.stats_submit)
 
-            if not args.no_ocr:
-                from ocr.pogoWindows import PogoWindows
-                pogoWindowManager = PogoWindows(args.temp_path, args.ocr_thread_count)
-
-            if ocr_enabled:
-                from ocr.copyMons import MonRaidImages
-                MonRaidImages.runAll(args.pogoasset, db_wrapper=db_wrapper)
+            from ocr.pogoWindows import PogoWindows
+            pogoWindowManager = PogoWindows(args.temp_path, args.ocr_thread_count)
 
             mitm_receiver_process = MITMReceiver(args.mitmreceiver_ip, int(args.mitmreceiver_port),
                                                  mitm_mapper, args, mapping_manager, db_wrapper)
             mitm_receiver_process.start()
 
-            logger.info('Starting scanner')
+            logger.info('Starting websocket server on port {}'.format(str(args.ws_port)))
             ws_server = WebsocketServer(args, mitm_mapper, db_wrapper, mapping_manager, pogoWindowManager)
             t_ws = Thread(name='scanner', target=ws_server.start_server)
             t_ws.daemon = False
             t_ws.start()
+
+            # init jobprocessor
+            device_Updater = deviceUpdater(ws_server, args, jobstatus)
 
             webhook_worker = None
             if args.webhook:
@@ -263,25 +240,14 @@ if __name__ == "__main__":
                 rarity.start_dynamic_rarity()
 
                 webhook_worker = WebhookWorker(
-                    args, db_wrapper, mapping_manager, rarity)
+                    args, db_wrapper.webhook_reader, mapping_manager, rarity)
                 t_whw = Thread(name="webhook_worker",
                                target=webhook_worker.run_worker)
                 t_whw.daemon = True
                 t_whw.start()
 
-    if args.only_ocr:
-        from ocr.copyMons import MonRaidImages
-
-        MonRaidImages.runAll(args.pogoasset, db_wrapper=db_wrapper)
-
-        logger.info('Starting OCR worker')
-        t_observ = Thread(
-            name='observer', target=start_ocr_observer, args=(args, db_wrapper,))
-        t_observ.daemon = True
-        t_observ.start()
-
     if args.statistic:
-        if args.only_ocr or args.only_scan:
+        if args.only_scan:
             logger.info("Starting statistics collector")
             t_usage = Thread(name='system',
                              target=get_system_infos, args=(db_wrapper,))
@@ -290,9 +256,10 @@ if __name__ == "__main__":
 
     if args.with_madmin:
         from madmin.madmin import madmin_start
-        logger.info("Starting Madmin on Port: {}", str(args.madmin_port))
+
+        logger.info("Starting Madmin on port {}", str(args.madmin_port))
         t_madmin = Thread(name="madmin", target=madmin_start,
-                          args=(args, db_wrapper, ws_server, mapping_manager))
+                          args=(args, db_wrapper, ws_server, mapping_manager, data_manager, device_Updater, jobstatus))
         t_madmin.daemon = True
         t_madmin.start()
 
@@ -320,9 +287,9 @@ if __name__ == "__main__":
             logger.info("Trying to stop receiver")
             mitm_receiver_process.shutdown()
             mitm_receiver_process.terminate()
-            logger.info("Trying to join MITMReceiver")
+            logger.debug("Trying to join MITMReceiver")
             mitm_receiver_process.join()
-            logger.info("MITMReceiver joined")
+            logger.debug("MITMReceiver joined")
             # mitm_receiver.stop_receiver()
             # mitm_receiver_thread.kill()
         # if t_file_watcher is not None:
@@ -334,10 +301,10 @@ if __name__ == "__main__":
             # mitm_mapper.shutdown()
             logger.debug("Calling mitm_mapper shutdown")
             mitm_mapper_manager.shutdown()
-        if db_wrapper_manager is not None:
-            logger.debug("Calling db_wrapper shutdown")
-            db_wrapper_manager.shutdown()
-            logger.debug("Done shutting down db_wrapper")
-        logger.debug("Done shutting down")
+        if db_pool_manager is not None:
+            logger.debug("Calling db_pool_manager shutdown")
+            db_pool_manager.shutdown()
+            logger.debug("Done shutting down db_pool_manager")
+        logger.info("Done shutting down")
         logger.debug(str(sys.exc_info()))
         sys.exit(0)

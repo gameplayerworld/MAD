@@ -17,7 +17,11 @@ class ADBConnect(object):
                 from adb.client import Client as AdbClient
             except ImportError:
                 pass
-            self.check_adblib = 'adb.client' in sys.modules
+            try:
+                from ppadb.client import Client as AdbClient
+            except ImportError:
+                pass
+            self.check_adblib = 'adb.client' in sys.modules or 'ppadb.client' in sys.modules
             if not self.check_adblib:
                 logger.warning(
                     "Could not find pure-python-adb library - no support for ADB."
@@ -102,6 +106,19 @@ class ADBConnect(object):
                              str(y) + " " + str(xe) + " " + str(ye) + " 100")
                 logger.info('MADMin ADB Swipe x:{} y:{} xe:{} ye:{}({})', str(
                     x), str(y), str(xe), str(ye), str(origin))
+                time.sleep(1)
+                return True
+        except Exception as e:
+            logger.exception(
+                'MADmin: Exception occurred while making screenswipe ({}): {}.', str(origin), e)
+        return False
+
+    def push_file(self, adb, origin, filename):
+        try:
+            device = self._client.device(adb)
+            if device is not None:
+                device.shell("adb push  " + str(filename) + " /sdcard/Download")
+                logger.info('MADMin ADB Push File {} to {})', str(filename), str(origin))
                 time.sleep(1)
                 return True
         except Exception as e:

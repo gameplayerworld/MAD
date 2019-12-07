@@ -1,25 +1,27 @@
 import json
+import os
 from typing import List, Optional
 
-from flask import (jsonify, render_template, request)
+from flask import (jsonify, render_template, request, redirect, url_for)
 from flask_caching import Cache
 
-from db.dbWrapperBase import DbWrapperBase
-from madmin.functions import auth_required, getCoordFloat, getBoundParameter
+from db.DbWrapper import DbWrapper
+from madmin.functions import (auth_required, getCoordFloat, getBoundParameter,
+                              get_geofences, generate_coords_from_geofence, Path)
 from utils.MappingManager import MappingManager
 from utils.collections import Location
 from utils.gamemechanicutil import get_raid_boss_cp
-from utils.language import i8ln
 from utils.questGen import generate_quest
 from utils.s2Helper import S2Helper
-from pathlib import Path
+from utils.logging import logger
+from utils.language import i8ln
 
 cache = Cache(config={'CACHE_TYPE': 'simple'})
 
 
 class map(object):
-    def __init__(self, db: DbWrapperBase, args, mapping_manager: MappingManager, app):
-        self._db: DbWrapperBase = db
+    def __init__(self, db: DbWrapper, args, mapping_manager: MappingManager, app):
+        self._db: DbWrapper = db
         self._args = args
         self._app = app
         if self._args.madmin_time == "12":
@@ -43,7 +45,9 @@ class map(object):
             ("/get_gymcoords", self.get_gymcoords),
             ("/get_quests", self.get_quests),
             ("/get_map_mons", self.get_map_mons),
-            ("/get_cells", self.get_cells)
+            ("/get_cells", self.get_cells),
+            ("/get_stops", self.get_stops),
+            ("/savefence", self.savefence)
         ]
         for route, view_func in routes:
             self._app.route(route)(view_func)
@@ -53,7 +57,7 @@ class map(object):
         setlat = request.args.get('lat', 0)
         setlng = request.args.get('lng', 0)
         return render_template('map.html', lat=self._args.home_lat, lng=self._args.home_lng,
-                               running_ocr=self._args.only_ocr, setlat=setlat, setlng=setlng)
+                               setlat=setlat, setlng=setlng)
 
     @auth_required
     def get_position(self):
@@ -75,9 +79,9 @@ class map(object):
     @auth_required
     def get_geofence(self):
         geofences = {}
-
         areas = self._mapping_manager.get_areas()
-        for name, area in areas.items():
+        for uri, area in areas.items():
+            aname = area['name']
             geofence_include = {}
             geofence_exclude = {}
             geofence_name = 'Unknown'
@@ -119,15 +123,15 @@ class map(object):
                                 getCoordFloat(lon)
                             ])
 
-            geofences[name] = {'include': geofence_include,
-                               'exclude': geofence_exclude}
-
+            geofences[aname] = {'include': geofence_include,
+                                'exclude': geofence_exclude}
+        geofences = get_geofences(self._mapping_manager)
         geofencexport = []
         for name, fences in geofences.items():
             coordinates = []
             for fname, coords in fences.get('include').items():
                 coordinates.append([coords, fences.get('exclude').get(fname, [])])
-            geofencexport.append({'name': name, 'coordinates': coordinates})
+            geofencexport.append({'name': areas[name]['name'], 'coordinates': coordinates})
 
         return jsonify(geofencexport)
 
@@ -139,6 +143,7 @@ class map(object):
 
         for routemanager in routemanager_names:
             mode = self._mapping_manager.routemanager_get_mode(routemanager)
+            name = self._mapping_manager.routemanager_get_name(routemanager)
             route: Optional[List[Location]] = self._mapping_manager.routemanager_get_current_route(routemanager)
 
             if route is None:
@@ -150,7 +155,7 @@ class map(object):
                     getCoordFloat(location.lat), getCoordFloat(location.lng)
                 ])
             routeexport.append({
-                "name": routemanager,
+                "name": name,
                 "mode": mode,
                 "coordinates": route_serialized
             })
@@ -165,6 +170,7 @@ class map(object):
 
         for routemanager in routemanager_names:
             mode = self._mapping_manager.routemanager_get_mode(routemanager)
+            name = self._mapping_manager.routemanager_get_name(routemanager)
             route: Optional[List[Location]] = self._mapping_manager.routemanager_get_current_prioroute(routemanager)
 
             if route is None:
@@ -179,7 +185,7 @@ class map(object):
                 })
 
             routeexport.append({
-                "name": routemanager,
+                "name": name,
                 "mode": mode,
                 "coordinates": route_serialized
             })
@@ -214,6 +220,7 @@ class map(object):
                 "lat": spawn["lat"],
                 "lon": spawn["lon"],
                 "spawndef": spawn["spawndef"],
+                "lastnonscan": spawn["lastnonscan"],
                 "lastscan": spawn["lastscan"],
                 "first_detection": spawn["first_detection"]
             })
@@ -260,6 +267,13 @@ class map(object):
     def get_quests(self):
         coords = []
 
+        fence = request.args.get("fence", None)
+        if fence not in (None, 'None', 'All'):
+            fence = generate_coords_from_geofence(self._mapping_manager, fence)
+        else:
+            fence = None
+
+
         neLat, neLon, swLat, swLon, oNeLat, oNeLon, oSwLat, oSwLon = getBoundParameter(request)
         timestamp = request.args.get("timestamp", None)
 
@@ -272,7 +286,8 @@ class map(object):
             oNeLon=oNeLon,
             oSwLat=oSwLat,
             oSwLon=oSwLon,
-            timestamp=timestamp
+            timestamp=timestamp,
+            fence=fence
         )
 
         for stopid in data:
@@ -311,7 +326,7 @@ class map(object):
                     mons_raw[str(id)] = mon_raw
 
                 data[i]["encounter_id"] = str(data[i]["encounter_id"])
-                data[i]["name"] = mon_raw["name"]
+                data[i]["name"] = i8ln(mon_raw["name"])
             except Exception:
                 traceback.print_exc()
 
@@ -343,3 +358,65 @@ class map(object):
             })
 
         return jsonify(ret)
+
+    @auth_required
+    def get_stops(self):
+        neLat, neLon, swLat, swLon, oNeLat, oNeLon, oSwLat, oSwLon = getBoundParameter(request)
+        timestamp = request.args.get("timestamp", None)
+
+        coords = []
+
+        data = self._db.get_stops_in_rectangle(
+            neLat,
+            neLon,
+            swLat,
+            swLon,
+            oNeLat=oNeLat,
+            oNeLon=oNeLon,
+            oSwLat=oSwLat,
+            oSwLon=oSwLon,
+            timestamp=timestamp
+        )
+
+        for stopid in data:
+            stop = data[str(stopid)]
+
+            coords.append({
+                "id": stopid,
+                "name": stop["name"],
+                "url": stop["image"],
+                "lat": stop["latitude"],
+                "lon": stop["longitude"],
+                "active_fort_modifier": stop["active_fort_modifier"],
+                "last_updated": stop["last_updated"],
+                "lure_expiration": stop["lure_expiration"],
+                "incident_start": stop["incident_start"],
+                "incident_expiration": stop["incident_expiration"],
+                "incident_grunt_type": stop["incident_grunt_type"]
+            })
+
+        return jsonify(coords)
+
+    @logger.catch()
+    @auth_required
+    def savefence(self):
+        name = request.args.get('name', False)
+        coords = request.args.get('coords', False)
+
+        if not name and not coords:
+            return redirect(url_for('map'), code=302)
+
+        coords_split = coords.split("|")
+        geofence_file_path = self._args.geofence_file_path
+
+        file = open(os.path.join(geofence_file_path, (str(name) + ".txt")), "a")
+        file.write("[" + str(name) + "]\n")
+        for i in range(len(coords_split)):
+            if coords_split[i] != '':
+                latlon_split = coords_split[i].split(",")
+                file.write("{0},{1}\n".format(str(float(latlon_split[0])), str(float(latlon_split[1]))))
+
+        file.close()
+
+        return redirect(url_for('map'), code=302)
+

@@ -21,6 +21,14 @@ var locInjectBtn = L.easyButton({
   }]
 });
 
+function loopCoords(coordarray) {
+    var returning = "";
+    coordarray[0].forEach((element, index, array) => {
+        returning += (element.lat + ',' + element.lng + '|');
+    });
+    return returning;
+};
+
 function copyClipboard(text) {
     navigator.clipboard.writeText(text.replace("|", ",")).then(function() {
         alert('Copying to clipboard was successful!');
@@ -109,6 +117,9 @@ var init = true;
 var fetchTimeout = null;
 var clickToScanActive = false;
 var cleanupInterval = null;
+var newfences = {};
+const teamNames = ['Uncontested', 'Mystic', 'Valor', 'Instinct']
+const iconBasePath = "https://raw.githubusercontent.com/whitewillem/PogoAssets/resized/icons_large";
 
 // object to hold all the markers and elements
 var leaflet_data = {
@@ -123,7 +134,8 @@ var leaflet_data = {
   workers: {},
   mons: {},
   monicons: {},
-  cellupdates: {}
+  cellupdates: {},
+  stops: {}
 };
 
 new Vue({
@@ -132,6 +144,7 @@ new Vue({
     raids: {},
     gyms: {},
     quests: {},
+    stops: {},
     spawns: {},
     mons: {},
     cellupdates: {},
@@ -140,6 +153,7 @@ new Vue({
         spawns: false,
         gyms: false,
         quests: false,
+        stops: false,
         workers: false,
         mons: false,
         cellupdates: false
@@ -231,6 +245,13 @@ new Vue({
 
       this.changeStaticLayer("quests", oldVal, newVal);
     },
+    "layers.stat.stops": function(newVal, oldVal) {
+      if (newVal && !init) {
+        this.map_fetch_stops(this.buildUrlFilter(true));
+      }
+
+      this.changeStaticLayer("stops", oldVal, newVal);
+    },
     "layers.stat.mons": function(newVal, oldVal) {
       if (newVal && !init) {
         this.map_fetch_mons(this.buildUrlFilter(true));
@@ -319,6 +340,7 @@ new Vue({
       this.map_fetch_geofences();
       this.map_fetch_spawns(urlFilter);
       this.map_fetch_quests(urlFilter);
+      this.map_fetch_stops(urlFilter);
       this.map_fetch_mons(urlFilter);
       this.map_fetch_prioroutes();
       this.map_fetch_cells(urlFilter);
@@ -470,9 +492,11 @@ new Vue({
           } else if (route.mode == "pokestops") {
             mode = "quests";
             cradius = $this.settings.routes.coordinateRadius.quests;
-          } else if (route.mode == "raids_mitm" || route.mode == "raids_ocr") {
+          } else if (route.mode == "raids_mitm") {
             mode = "raids";
             cradius = $this.settings.routes.coordinateRadius.raids;
+          } else {
+            mode = route.mode;
           }
 
           route.coordinates.forEach(function (coord) {
@@ -532,13 +556,13 @@ new Vue({
             map.removeLayer(leaflet_data["prioroutes"][name]);
           }
 
-          if (route.mode == "mon_mitm") {
+          if (route.mode == "mon_mitm" || route.mode == "iv_mitm") {
             mode = "mons";
             cradius = $this.settings.routes.coordinateRadius.mons;
           } else if (route.mode == "pokestops") {
             mode = "quests";
             cradius = $this.settings.routes.coordinateRadius.quests;
-          } else if (route.mode == "raids_mitm" || route.mode == "raids_ocr") {
+          } else if (route.mode == "raids_mitm") {
             mode = "raids";
             cradius = $this.settings.routes.coordinateRadius.raids;
           }
@@ -704,12 +728,45 @@ new Vue({
             id: quest["pokestop_id"],
             virtual: true,
             icon: $this.build_quest_small(quest['quest_reward_type_raw'], quest['item_id'], quest['pokemon_id'])
-          }).bindPopup($this.build_stop_popup, { "className": "questpopup"});
+          }).bindPopup($this.build_quest_popup, { "className": "questpopup"});
 
           $this.addMouseEventPopup(leaflet_data["quests"][quest["pokestop_id"]]);
 
           if ($this.layers.stat.quests) {
             leaflet_data["quests"][quest["pokestop_id"]].addTo(map);
+          }
+        });
+      });
+    },
+    map_fetch_stops(urlFilter) {
+      var $this = this;
+
+      if (!$this.layers.stat.stops) {
+        return;
+      }
+
+      axios.get("get_stops" + urlFilter).then(function (res) {
+        res.data.forEach(function(stop) {
+          if ($this.stops[stop["id"]]) {
+            return;
+          }
+
+          $this.stops[stop["id"]] = stop;
+
+          leaflet_data["stops"][stop["id"]] = L.circle([stop["lat"], stop["lon"]], {
+            radius: 8,
+            color: 'blue',
+            fillColor: 'blue',
+            weight: 1,
+            opacity: 0.7,
+            fillOpacity: 0.5,
+            id: stop["id"]
+          }).bindPopup($this.build_stop_popup, { "className": "stoppopup"});
+
+          $this.addMouseEventPopup(leaflet_data["stops"][stop["id"]]);
+
+          if ($this.layers.stat.stops) {
+            leaflet_data["stops"][stop["id"]].addTo(map);
           }
         });
       });
@@ -775,7 +832,7 @@ new Vue({
               var icon = leaflet_data["monicons"][mon["mon_id"]];
             } else {
               var form = mon["form"] == 0 ? "00" : mon["form"];
-              var image = `https://raw.githubusercontent.com/whitewillem/PogoAssets/resized/icons_large/pokemon_icon_${String.prototype.padStart.call(mon["mon_id"], 3, 0)}_${form}.png`;
+              var image = `${iconBasePath}/pokemon_icon_${String.prototype.padStart.call(mon["mon_id"], 3, 0)}_${form}.png`;
               var icon = L.icon({
                 iconUrl: image,
                 iconSize: [40, 40],
@@ -917,23 +974,19 @@ new Vue({
     build_quest_small(quest_reward_type_raw, quest_item_id, quest_pokemon_id) {
       switch (quest_reward_type_raw) {
         case 2:
-          var image = 'static/quest/reward_' + quest_item_id + '_1.png';
+          var image = `${iconBasePath}/rewards/reward_${quest_item_id}_1.png`;
           var size = [30, 30]
-          var anchor = [30, 20]
+          var anchor = [30, 30]
           break;
         case 3:
-          var image = 'static/quest/reward_stardust.png';
+          var image = `${iconBasePath}/rewards/reward_stardust.png`;
           var size = [30, 30]
-          var anchor = [30, 20]
+          var anchor = [30, 30]
           break;
         case 7:
-          var form = '00';
-          if (quest_pokemon_id === 327) {
-            form = '11';
-          }
-          var image = 'asset/pokemon_icons/pokemon_icon_' + String.prototype.padStart.call(quest_pokemon_id, 3, 0) + '_' + form + '.png';
-          var size = [50, 50]
-          var anchor = [40, 30]
+          var image = `${iconBasePath}/pokemon_icon_${String.prototype.padStart.call(quest_pokemon_id, 3, 0)}_00.png`;
+          var size = [30, 30]
+          var anchor = [30, 30]
           break;
       }
 
@@ -941,6 +994,7 @@ new Vue({
         iconUrl: 'static/Pstop-quest.png',
         shadowUrl: image,
         iconSize: [30, 30],
+        iconAnchor: [15, 30],
         shadowSize: size,
         shadowAnchor: anchor
       })
@@ -952,19 +1006,15 @@ new Vue({
 
       switch (quest_reward_type_raw) {
         case 2:
-          var image = `static/quest/reward_${quest_item_id}_1.png`;
+          var image = `${iconBasePath}/rewards/reward_${quest_item_id}_1.png`;
           var rewardtext = `${quest_item_amount}x ${quest_item_type}`;
           break;
         case 3:
-          var image = "static/quest/reward_stardust.png";
+          var image = `${iconBasePath}/rewards/reward_stardust.png`;
           var rewardtext = `${quest_item_amount} ${quest_item_type}`;
           break;
         case 7:
-          var form = '00';
-          if (quest_pokemon_id === 327) {
-            form = '11';
-          }
-          var image = `asset/pokemon_icons/pokemon_icon_${String.prototype.padStart.call(quest_pokemon_id, 3, 0)}_${form}.png`;
+          var image = `${iconBasePath}/pokemon_icon_${String.prototype.padStart.call(quest_pokemon_id, 3, 0)}_00.png`;
           var rewardtext = quest_pokemon_name;
           var size = "150%";
           break;
@@ -977,22 +1027,52 @@ new Vue({
           <div class="rewardImg" style="background-image: url(${image}); background-size: ${size}"></div>
         </div>`;
     },
-    build_stop_popup(marker) {
-      var quest = this.quests[marker.options.id];
+    build_stop_base_popup(id, image, name, latitude, longitude) {
+      return `
+          <div class="image" style="background: url(${image}) center center no-repeat;"></div>
+          <div class="name"><strong>${name}</strong></div>
+          <div class="id"><i class="fa fa-fingerprint"></i> <span>${id}</span></div>
+          <div class="coords">
+            <i class="fa fa-map-pin"></i>
+            <a href="https://maps.google.com/?q=${latitude},${longitude}">${latitude}, ${longitude}</a>
+            <a onclick=copyClipboard("${latitude.toFixed(6)}|${longitude.toFixed(6)}") href="#"><i class="fa fa-clipboard" aria-hidden="true"></i></a>
+          </div>`
+    },
+    build_quest_popup(marker) {
+      var quest = this.quests[marker.options.id]
+      var base_popup = this.build_stop_base_popup(quest["pokestop_id"], quest["url"], quest["name"], quest["latitude"], quest["longitude"])
 
       return `
         <div class="content">
-          <div class="image" style="background: url(${quest["url"]}) center center no-repeat;"></div>
-          <div class="name"><strong>${quest["name"]}</strong></div>
-          <div class="id"><i class="fa fa-fingerprint"></i> <span>${quest["pokestop_id"]}</span></div>
-          <div class="coords">
-            <i class="fa fa-map-pin"></i>
-            <a href="https://maps.google.com/?q=${quest["latitude"]},${quest["longitude"]}">${quest["latitude"]}, ${quest["longitude"]}</a>
-            <a onclick=copyClipboard("${quest["latitude"].toFixed(6)}|${quest["longitude"].toFixed(6)}") href="#"><i class="fa fa-clipboard" aria-hidden="true"></i></a>
-          </div>
-          <div id="questTimestamp"><i class="fa fa-clock"></i> Scanned: ${moment(quest['timestamp']*1000).format("YYYY-MM-DD HH:mm:ss")}</div>
+          ${base_popup}
+          <div id="questTimestamp"><i class="fa fa-clock"></i> Scanned: <strong>${moment(quest['timestamp']*1000).format("YYYY-MM-DD HH:mm:ss")}</strong></div>
           <br>
           ${this.build_quest(quest['quest_reward_type_raw'], quest['quest_task'], quest['pokemon_id'], quest['item_id'], quest['item_amount'], quest['pokemon_name'], quest['item_type'])}
+        </div>`;
+    },
+    build_stop_popup(marker) {
+      var stop = this.stops[marker.options.id]
+      var base_popup = this.build_stop_base_popup(stop["id"], stop["url"], stop["name"], stop["lat"], stop["lon"])
+
+      var incident = "";
+      var incident_expiration = moment(stop["incident_expiration"]*1000);
+      if (incident_expiration.isAfter(moment())) {
+        incident = `<div class="incident"><i class="fa fa-user-secret"></i> Incident ends: <strong>${incident_expiration.format("YYYY-MM-DD HH:mm:ss")}</strong></div>`
+      }
+
+      var lure = "";
+      var lure_expiration = moment(stop["lure_expiration"]*1000);
+      if (lure_expiration.isAfter(moment())) {
+        lure = `<div class="incident"><i class="fa fa-drumstick-bite"></i> Lure ends: <strong>${lure_expiration.format("YYYY-MM-DD HH:mm:ss")}</strong></div>`
+      }
+
+      return `
+        <div class="content">
+          ${base_popup}
+          <br>
+          <div class="timestamp"><i class="fa fa-clock"></i> Scanned: <strong>${moment(stop["last_updated"]*1000).format("YYYY-MM-DD HH:mm:ss")}</strong></div>
+          ${incident}
+          ${lure}
         </div>`;
     },
     build_gym_popup(marker) {
@@ -1005,22 +1085,10 @@ new Vue({
         if (raid["mon"]) {
           var mon = String.prototype.padStart.call(raid["mon"], 3, 0);
           var form = String.prototype.padStart.call(raid["form"], 2, 0);
-          var image = `asset/pokemon_icons/pokemon_icon_${mon}_${form}.png`;
+          var image = `${iconBasePath}/pokemon_icon_${mon}_${form}.png`;
           var monText = `<div class="monId"><i class="fas fa-ghost"></i> Mon: <strong>#${raid["mon"]}</strong></div>`
         } else {
-          switch (raid["level"]) {
-            case 1:
-            case 2:
-              var image = "asset/static_assets/png/ic_raid_egg_normal.png";
-              break;
-            case 3:
-            case 4:
-              var image = "asset/static_assets/png/ic_raid_egg_rare.png";
-              break;
-            case 5:
-              var image = "asset/static_assets/png/ic_raid_egg_legendary.png";
-              break;
-          }
+          var image = `${iconBasePath}/egg${raid["level"]}.png`;
         }
 
         var levelStars = `<i class="fas fa-star"></i>`.repeat(raid["level"]);
@@ -1054,14 +1122,14 @@ new Vue({
           </div>`;
       }
 
-
+      var gymName = gym["name"] != "unknown" ? gym["name"] : teamNames[gym["team_id"]] + " Gym"
       var timeformat = "YYYY-MM-DD HH:mm:ss";
       var last_scanned = moment(gym["last_scanned"]*1000);
 
       return `
         <div class="content">
           <div class="image" style="background: url(${gym["img"]}) center center no-repeat;"></div>
-          <div class="name"><strong>${gym["name"]}</strong></div>
+          <div class="name"><strong>${gymName}</strong></div>
           <div class="id"><i class="fa fa-fingerprint"></i> <span>${gym["id"]}</span></div>
           <div class="coords">
             <i class="fa fa-map-pin"></i>
@@ -1113,10 +1181,12 @@ new Vue({
 
         var spawntiming = `
           <div class="spawn"><i class="fa fa-hourglass-start"></i> Spawn: <strong>${spawntime.format(timeformat)} ${activeText}</strong></div>
-          <div class="despawn"><i class="fa fa-hourglass-end"></i> Despawn: <strong>${despawntime.format(timeformat)}</strong></div>`;
+          <div class="despawn"><i class="fa fa-hourglass-end"></i> Despawn: <strong>${despawntime.format(timeformat)}</strong></div>`
       } else {
-        var spawntiming = "";
+        var spawntiming = ""
       }
+
+      const lastMon = spawn["lastscan"] > spawn["lastnonscan"] ? spawn["lastscan"] : spawn["lastnonscan"]
 
       return `
         <div class="content">
@@ -1125,11 +1195,12 @@ new Vue({
             <i class ="fa fa-map-pin"></i>
             <a href="https://maps.google.com/?q=${spawn["lat"]},${spawn["lon"]}">${spawn["lat"].toFixed(6)}, ${spawn["lon"].toFixed(6)}</a>
          </div>
-         <div class="timestamp"><i class="fa fa-clock"></i> Scanned: ${spawn["lastscan"]}</div>
          <br>
           <div cla ss="spawnContent">
-            <div class="spawnFirstDetection"><i class="fas fa-baby"></i> First seen: ${spawn["first_detection"]}</div>
-            <div class="spawnType"><i class="fa fa-wrench"></i> Type: <strong>${type || "Unknown"}</strong> spawnpoint</div>
+            <div class="spawnFirstDetection"><i class="fas fa-baby"></i> First seen: <strong>${spawn["first_detection"]}</strong></div>
+            <div class="timestamp"><i class="fas fa-eye"></i> <abbr title="This is the time a mon has been seen on this spawnpoint.">Last mon seen</abbr>: <strong>${lastMon}</strong></div>
+            <div class="timestamp"><i class="fa fa-clock"></i> <abbr title="The timestamp of the last time this spawnpoint's despawn time has been confirmed.">Last confirmation</abbr>: <strong>${spawn["lastscan"]}</strong></div>
+            <div class="spawnType"><i class="fa fa-wrench"></i> Type: <strong>${type || "Unknown despawn time"}</strong></div>
             <div class="spawnTiming">${spawntiming}</div>
           </div>
         </div>`;
@@ -1138,7 +1209,7 @@ new Vue({
       mon = this.mons[marker.options.id];
 
       var form = mon["form"] == 0 ? "00" : mon["form"];
-      var image = `https://raw.githubusercontent.com/whitewillem/PogoAssets/resized/icons_large/pokemon_icon_${String.prototype.padStart.call(mon["mon_id"], 3, 0)}_${form}.png`;
+      var image = `${iconBasePath}/pokemon_icon_${String.prototype.padStart.call(mon["mon_id"], 3, 0)}_${form}.png`;
 
       var iv = (mon["individual_attack"] + mon["individual_defense"] + mon["individual_stamina"])*100/45;
       var end = moment(mon["disappear_time"]*1000);
@@ -1156,7 +1227,7 @@ new Vue({
       }
 
       var ivtext = "";
-      if (iv !== 0) {
+      if (mon["cp"]  > 0) {
         ivtext = `
             <div class="iv">
               <i class="fas fa-award"></i> IV: <strong style="color: ${ivcolor}">${Math.round(iv * 100) / 100}%</strong>
@@ -1257,7 +1328,8 @@ new Vue({
     },
     l_event_click(e) {
       if(clickToScanActive) {
-        $('#injectionModal').data('coords', e.latlng.lat + ',' + e.latlng.lng).modal();
+        $("#injectLocation").val(`${e.latlng.lat.toFixed(6)},${e.latlng.lng.toFixed(6)}`);
+        $("#injectionModal").modal();
       }
     },
     addMouseEventPopup(marker) {
@@ -1308,7 +1380,7 @@ new Vue({
       $.ajax({
         type: "GET",
         url: 'send_gps?origin=' + $('#injectionWorker').val() +
-          '&coords=' + $('#injectionModal').data('coords') +
+          '&coords=' + $('#injectLocation').val() +
           '&sleeptime=' + $('#injectionSleep').val()
       });
     },
@@ -1402,14 +1474,25 @@ new Vue({
       // get stored center and zoom level if they exists
       const storedZoom = this.getStoredSetting('zoomlevel', 3);
       const storedCenter = this.getStoredSetting('center', '52.521374,13.411201');
-      leaflet_data.tileLayer = L.tileLayer(this.maptiles[this.settings.maptiles].url);
+      leaflet_data.tileLayer = L.tileLayer(this.maptiles[this.settings.maptiles].url, {
+        noWrap: true,
+        bounds: [
+          [-90, -180],
+          [90, 180]
+        ]
+      });
 
       map = L.map('map', {
         layers: [leaflet_data.tileLayer],
         zoomControl: false,
         updateWhenZooming: false,
         updateWhenIdle: true,
-        preferCanvas: true
+        preferCanvas: true,
+        worldCopyJump: true,
+        maxBounds: [
+          [-90, -180],
+          [90, 180]
+        ]
       }).setView(storedCenter.split(','), storedZoom);
 
       // add custom button
@@ -1453,6 +1536,63 @@ new Vue({
         sidebar.close();
       });
 
+    var editableLayers = new L.FeatureGroup();
+    map.addLayer(editableLayers);
+
+    var options = {
+        position: 'topright',
+        draw: {
+            polyline: false,
+            polygon: {
+                allowIntersection: false,
+                drawError: {
+                    color: '#e1e100',
+                    message: '<strong>Oh snap!<strong> you can\'t draw that!'
+                },
+                shapeOptions: {
+                    color: '#ac00e6'
+                }
+            },
+            circle: false,
+            circlemarker: false,
+            rectangle: false,
+            line: false,
+            marker: false,
+        },
+        edit: {
+            featureGroup: editableLayers,
+            remove: false
+        }
+    };
+
+    var drawControl = new L.Control.Draw(options);
+    map.addControl(drawControl);
+
+    map.on(L.Draw.Event.CREATED, function (e) {
+        var type = e.layerType,
+            layer = e.layer;
+
+        if (type != "polygon") {
+          return;
+        }
+
+        var fencename = prompt("Please enter name of fence", "");
+        coords = loopCoords(layer.getLatLngs())
+        newfences[layer] = fencename
+        layer.bindPopup('<b>' + fencename + '</b><br><a href=savefence?name=' + fencename + '&coords=' + coords + '>Save to MAD</a>');
+        editableLayers.addLayer(layer);
+        layer.openPopup();
+    });
+
+    map.on('draw:edited', function (e) {
+        var layers = e.layers;
+        layers.eachLayer(function (layer) {
+            coords = loopCoords(layer.getLatLngs())
+            layer._popup.setContent('<b>' + newfences[layer] + '</b><br><a href=savefence?name=' + newfences[layer] + '&coords=' + coords + '>Save to MAD</a>')
+            layer.openPopup();
+        });
+    });
+
       // initial load
       this.map_fetch_everything();
 
@@ -1464,4 +1604,3 @@ new Vue({
     }
   }
 });
-

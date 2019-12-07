@@ -1,7 +1,8 @@
 import math
 import time
+from datetime import datetime
 
-from db.dbWrapperBase import DbWrapperBase
+from db.DbWrapper import DbWrapper
 from mitm_receiver.MitmMapper import MitmMapper
 from ocr.pogoWindows import PogoWindows
 from utils.MappingManager import MappingManager
@@ -35,14 +36,17 @@ class WorkerMITM(MITMBase):
         routemanager_settings = self._mapping_manager.routemanager_get_settings(self._routemanager_name)
         # get the distance from our current position (last) to the next gym (cur)
         distance = get_distance_of_two_points_in_meters(float(self.last_location.lat),
-                                                        float(
-                                                            self.last_location.lng),
-                                                        float(
-                                                            self.current_location.lat),
+                                                        float(self.last_location.lng),
+                                                        float(self.current_location.lat),
                                                         float(self.current_location.lng))
         logger.debug('Moving {} meters to the next position', round(distance, 2))
-        speed = routemanager_settings.get("speed", 0)
-        max_distance = routemanager_settings.get("max_distance", None)
+        if not self._mapping_manager.routemanager_get_init(self._routemanager_name):
+            speed = routemanager_settings.get("speed", 0)
+            max_distance = routemanager_settings.get("max_distance", None)
+        else:
+            speed = int(25)
+            max_distance = int(200)
+
         if (speed == 0 or
                 (max_distance and 0 < max_distance < distance)
                 or (self.last_location.lat == 0.0 and self.last_location.lng == 0.0)):
@@ -56,12 +60,12 @@ class WorkerMITM(MITMBase):
             delay_used = self.get_devicesettings_value('post_teleport_delay', 7)
             # Test for cooldown / teleported distance TODO: check this block...
             if self.get_devicesettings_value('cool_down_sleep', False):
-                if distance > 2500:
-                    delay_used = 8
+                if distance > 10000:
+                    delay_used = 15
                 elif distance > 5000:
                     delay_used = 10
-                elif distance > 10000:
-                    delay_used = 15
+                elif distance > 2500:
+                    delay_used = 8
                 logger.debug(
                     "Need more sleep after Teleport: {} seconds!", str(delay_used))
                 # curTime = math.floor(time.time())  # the time we will take as a starting point to wait for data...
@@ -114,44 +118,11 @@ class WorkerMITM(MITMBase):
 
     def _pre_work_loop(self):
         logger.info("MITM worker starting")
-        self._check_ggl_login()
         if not self._wait_for_injection() or self._stop_worker_event.is_set():
             raise InternalStopWorkerException
 
-    def _start_pogo(self):
-        pogo_topmost = self._communicator.isPogoTopmost()
-        if pogo_topmost:
-            return True
-
-        if not self._communicator.isScreenOn():
-            self._communicator.startApp("de.grennith.rgc.remotegpscontroller")
-            logger.warning("Turning screen on")
-            self._communicator.turnScreenOn()
-            time.sleep(self.get_devicesettings_value("post_turn_screen_on_delay", 7))
-
-        cur_time = time.time()
-        start_result = False
-        while not pogo_topmost:
-            self._mitm_mapper.set_injection_status(self._id, False)
-            start_result = self._communicator.startApp(
-                "com.nianticlabs.pokemongo")
-            time.sleep(1)
-            pogo_topmost = self._communicator.isPogoTopmost()
-
-        reached_raidtab = False
-        if start_result:
-            logger.warning("startPogo: Starting pogo...")
-            self._last_known_state["lastPogoRestart"] = cur_time
-
-            # let's handle the login and stuff
-            reached_raidtab = True
-
-        self._wait_pogo_start_delay()
-
-        return reached_raidtab
-
     def __init__(self, args, id, last_known_state, websocket_handler, mapping_manager: MappingManager,
-                 routemanager_name: str, mitm_mapper: MitmMapper, db_wrapper: DbWrapperBase,
+                 routemanager_name: str, mitm_mapper: MitmMapper, db_wrapper: DbWrapper,
                  pogo_window_manager: PogoWindows, walker):
         MITMBase.__init__(self, args, id, last_known_state, websocket_handler,
                           mapping_manager=mapping_manager, routemanager_name=routemanager_name,
@@ -177,12 +148,14 @@ class WorkerMITM(MITMBase):
             scanmode = "mons"
             routemanager_settings = self._mapping_manager.routemanager_get_settings(self._routemanager_name)
             if routemanager_settings is not None:
-                ids_iv = routemanager_settings.get("mon_ids_iv", None)
+                ids_iv = self._mapping_manager.get_monlist(routemanager_settings.get("mon_ids_iv", None),
+                                                           self._routemanager_name)
         elif routemanager_mode == "raids_mitm":
             scanmode = "raids"
             routemanager_settings = self._mapping_manager.routemanager_get_settings(self._routemanager_name)
             if routemanager_settings is not None:
-                ids_iv = routemanager_settings.get("mon_ids_iv", None)
+                ids_iv = self._mapping_manager.get_monlist(routemanager_settings.get("mon_ids_iv", None),
+                                                           self._routemanager_name)
         elif routemanager_mode == "iv_mitm":
             scanmode = "ivs"
             ids_iv = self._mapping_manager.routemanager_get_encounter_ids_left(self._routemanager_name)

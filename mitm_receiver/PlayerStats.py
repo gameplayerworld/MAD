@@ -7,13 +7,13 @@ from multiprocessing import Lock
 from pathlib import Path
 from copy import deepcopy
 
-from db.dbWrapperBase import DbWrapperBase
+from db.DbWrapper import DbWrapper
 from mitm_receiver import MitmMapper
 from utils.logging import logger
 
 
 class PlayerStats(object):
-    def __init__(self, id, application_args, db_wrapper: DbWrapperBase, mitm_mapper_parent: MitmMapper):
+    def __init__(self, id, application_args, mitm_mapper_parent: MitmMapper):
         self._id = id
         self.__application_args = application_args
         self._level = 0
@@ -22,8 +22,8 @@ class PlayerStats(object):
         self.__stats_collected: dict = {}
         self._stats_collector_start = True
         self._last_processed_timestamp = 0
-        self._db_wrapper: DbWrapperBase = db_wrapper
         self._stats_period = 0
+        self._generate_stats = application_args.game_stats
         self.__mapping_mutex = Lock()
         self.__mitm_mapper_parent: MitmMapper = mitm_mapper_parent
 
@@ -82,19 +82,21 @@ class PlayerStats(object):
         logger.debug2("Creating stats_collector task for {}".format(self._id))
         with self.__mapping_mutex:
             if not self._stats_collector_start:
-                if time.time() - self._last_processed_timestamp > 600 or self.compare_hour(self._last_processed_timestamp):
-                    stats_collected_tmp = deepcopy(self.__stats_collected)
-                    del self.__stats_collected
-                    self.__stats_collected = {}
+                if time.time() - self._last_processed_timestamp > 300 or \
+                        self.compare_hour(self._last_processed_timestamp):
+
                     self._last_processed_timestamp = time.time()
 
-                    self.__mitm_mapper_parent.add_stats_to_process(self._id, stats_collected_tmp,
+                    self.__mitm_mapper_parent.add_stats_to_process(self._id, self.__stats_collected.copy(),
                                                                    self._last_processed_timestamp)
+                    self.__stats_collected.clear()
             else:
                 self._stats_collector_start = False
                 self._last_processed_timestamp = time.time()
 
     def stats_collect_mon(self, encounter_id: str):
+        if not self._generate_stats:
+            return
         with self.__mapping_mutex:
             if 106 not in self.__stats_collected:
                 self.__stats_collected[106] = {}
@@ -111,7 +113,9 @@ class PlayerStats(object):
             else:
                 self.__stats_collected[106]['mon'][encounter_id] += 1
 
-    def stats_collect_mon_iv(self, encounter_id: str):
+    def stats_collect_mon_iv(self, encounter_id: str, shiny: int):
+        if not self._generate_stats:
+            return
         with self.__mapping_mutex:
             if 102 not in self.__stats_collected:
                 self.__stats_collected[102] = {}
@@ -123,12 +127,16 @@ class PlayerStats(object):
                 self.__stats_collected[102]['mon_iv_count'] = 0
     
             if encounter_id not in self.__stats_collected[102]['mon_iv']:
-                self.__stats_collected[102]['mon_iv'][encounter_id] = 1
+                self.__stats_collected[102]['mon_iv'][encounter_id] = {}
+                self.__stats_collected[102]['mon_iv'][encounter_id]['count'] = 1
+                self.__stats_collected[102]['mon_iv'][encounter_id]['shiny'] = shiny
                 self.__stats_collected[102]['mon_iv_count'] += 1
             else:
-                self.__stats_collected[102]['mon_iv'][encounter_id] += 1
+                self.__stats_collected[102]['mon_iv'][encounter_id]['count'] += 1
 
     def stats_collect_raid(self, gym_id: str):
+        if not self._generate_stats:
+            return
         with self.__mapping_mutex:
             if 106 not in self.__stats_collected:
                 self.__stats_collected[106] = {}
@@ -146,6 +154,8 @@ class PlayerStats(object):
                 self.__stats_collected[106]['raid'][gym_id] += 1
 
     def stats_collect_quest(self, stop_id):
+        if not self._generate_stats:
+            return
         with self.__mapping_mutex:
             if 106 not in self.__stats_collected:
                 self.__stats_collected[106] = {}
@@ -164,6 +174,8 @@ class PlayerStats(object):
 
     def stats_collect_location_data(self, location, datarec, start_timestamp, type, rec_timestamp, walker,
                                     transporttype):
+        if not self._generate_stats:
+            return
         with self.__mapping_mutex:
             if 'location' not in self.__stats_collected:
                 self.__stats_collected['location'] = []
@@ -266,10 +278,11 @@ class PlayerStats(object):
                     type_count = int(data[106]['mon'][mon_id])
 
                     data_location_raw.append((str(client_id),
-                                             str(type_id),
-                                             'mon',
-                                             str(type_count),
-                                             str(int(period))
+                                              str(type_id),
+                                              'mon',
+                                              str(type_count),
+                                              0,
+                                              str(int(period))
                                               ))
 
             if 'raid' in data[106]:
@@ -278,10 +291,11 @@ class PlayerStats(object):
                     type_count = int(data[106]['raid'][gym_id])
 
                     data_location_raw.append((str(client_id),
-                                             str(type_id),
-                                             'raid',
-                                             str(type_count),
-                                             str(int(period))
+                                              str(type_id),
+                                              'raid',
+                                              str(type_count),
+                                              0,
+                                              str(int(period))
                                               ))
 
             if 'quest' in data[106]:
@@ -290,23 +304,26 @@ class PlayerStats(object):
                     type_count = int(data[106]['quest'][stop_id])
 
                     data_location_raw.append((str(client_id),
-                                             str(type_id),
-                                             'quest',
-                                             str(type_count),
-                                             str(int(period))
+                                              str(type_id),
+                                              'quest',
+                                              str(type_count),
+                                              0,
+                                              str(int(period))
                                               ))
 
         if 102 in data:
             if 'mon_iv' in data[102]:
                 for mon_id in data[102]['mon_iv']:
                     type_id = str(mon_id)
-                    type_count = int(data[102]['mon_iv'][mon_id])
+                    type_count = int(data[102]['mon_iv'][mon_id]['count'])
+                    shiny = int(data[102]['mon_iv'][mon_id]["shiny"])
 
                     data_location_raw.append((str(client_id),
-                                             str(type_id),
-                                             'mon_iv',
-                                             str(type_count),
-                                             str(int(period))
+                                              str(type_id),
+                                              'mon_iv',
+                                              str(type_count),
+                                              shiny,
+                                              str(int(period))
                                               ))
 
         logger.debug('Submit raw detection stats for {} - Period: {} - Count: {}', str(client_id), str(period),

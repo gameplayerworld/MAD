@@ -5,7 +5,7 @@ from multiprocessing.managers import SyncManager
 from threading import Thread, Event
 from typing import Dict
 
-from db.dbWrapperBase import DbWrapperBase
+from db.DbStatsSubmit import DbStatsSubmit
 from utils.MappingManager import MappingManager
 from utils.collections import Location
 from utils.logging import logger
@@ -20,14 +20,16 @@ class MitmMapperManager(SyncManager):
 
 
 class MitmMapper(object):
-    def __init__(self, mapping_manager: MappingManager, db_wrapper):
+    def __init__(self, mapping_manager: MappingManager, db_stats_submit: DbStatsSubmit):
         self.__mapping = {}
         self.__playerstats: Dict[str, PlayerStats] = {}
         self.__mapping_mutex = Lock()
         self.__mapping_manager: MappingManager = mapping_manager
         self.__injected = {}
+        self.__last_cellsid = {}
+        self.__last_possibly_moved = {}
         self.__application_args = args
-        self.__db_wrapper: DbWrapperBase = db_wrapper
+        self._db_stats_submit: DbStatsSubmit = db_stats_submit
         self.__playerstats_db_update_stop: Event = Event()
         self.__playerstats_db_update_queue: Queue = Queue()
         self.__playerstats_db_update_mutex: Lock = Lock()
@@ -36,7 +38,7 @@ class MitmMapper(object):
         if self.__mapping_manager is not None:
             for origin in self.__mapping_manager.get_all_devicemappings().keys():
                 self.__mapping[origin] = {}
-                self.__playerstats[origin] = PlayerStats(origin, self.__application_args, self.__db_wrapper, self)
+                self.__playerstats[origin] = PlayerStats(origin, self.__application_args, self)
                 self.__playerstats[origin].open_player_stats()
         self.__playerstats_db_update_consumer.daemon = True
         self.__playerstats_db_update_consumer.start()
@@ -49,6 +51,9 @@ class MitmMapper(object):
     def __internal_playerstats_db_update_consumer(self):
         try:
             while not self.__playerstats_db_update_stop.is_set():
+                if not self.__application_args.game_stats:
+                    logger.info("Playerstats are disabled")
+                    break
                 try:
                     with self.__playerstats_db_update_mutex:
                         next_item = self.__playerstats_db_update_queue.get_nowait()
@@ -71,14 +76,18 @@ class MitmMapper(object):
         data_send_stats.append(PlayerStats.stats_complete_parser(client_id, stats, last_processed_timestamp))
         data_send_location.append(PlayerStats.stats_location_parser(client_id, stats, last_processed_timestamp))
 
-        self.__db_wrapper.submit_stats_complete(data_send_stats)
-        self.__db_wrapper.submit_stats_locations(data_send_location)
+        self._db_stats_submit.submit_stats_complete(data_send_stats)
+        self._db_stats_submit.submit_stats_locations(data_send_location)
         if self.__application_args.game_stats_raw:
             data_send_location_raw = PlayerStats.stats_location_raw_parser(client_id, stats, last_processed_timestamp)
             data_send_detection_raw = PlayerStats.stats_detection_raw_parser(client_id, stats, last_processed_timestamp)
-            self.__db_wrapper.submit_stats_locations_raw(data_send_location_raw)
-            self.__db_wrapper.submit_stats_detections_raw(data_send_detection_raw)
-        self.__db_wrapper.cleanup_statistics()
+            self._db_stats_submit.submit_stats_locations_raw(data_send_location_raw)
+            self._db_stats_submit.submit_stats_detections_raw(data_send_detection_raw)
+
+        data_send_stats.clear()
+        data_send_location.clear()
+
+        self._db_stats_submit.cleanup_statistics()
 
     def shutdown(self):
         self.__playerstats_db_update_stop.set()
@@ -168,9 +177,9 @@ class MitmMapper(object):
         if self.__playerstats.get(origin, None) is not None:
             self.__playerstats.get(origin).stats_collect_mon(encounter_id)
 
-    def collect_mon_iv_stats(self, origin: str, encounter_id: str):
+    def collect_mon_iv_stats(self, origin: str, encounter_id: str, shiny: int):
         if self.__playerstats.get(origin, None) is not None:
-            self.__playerstats.get(origin).stats_collect_mon_iv(encounter_id)
+            self.__playerstats.get(origin).stats_collect_mon_iv(encounter_id, shiny)
 
     def collect_quest_stats(self, origin: str, stop_id: str):
         if self.__playerstats.get(origin, None) is not None:
@@ -179,3 +188,24 @@ class MitmMapper(object):
     def generate_player_stats(self, origin: str, inventory_proto: dict):
         if self.__playerstats.get(origin, None) is not None:
             self.__playerstats.get(origin).gen_player_stats(inventory_proto)
+
+    def submit_gmo_for_location(self, origin, payload):
+        logger.debug4("submit_gmo_for_location of {}", origin)
+        cells = payload.get("cells", None)
+        
+        if cells is None:
+            return
+
+        current_cells_id = sorted(list(map(lambda x : x['id'], cells)))
+        if origin in self.__last_cellsid:
+            last_cells_id = self.__last_cellsid[origin]
+            self.__last_cellsid[origin] = current_cells_id
+            if last_cells_id != current_cells_id:
+                self.__last_possibly_moved[origin] = time.time()
+        else:
+            self.__last_cellsid[origin] = current_cells_id
+            self.__last_possibly_moved[origin] = time.time()
+        logger.debug4("Done submit_gmo_for_location of {} with {}", origin, current_cells_id)
+
+    def get_last_timestamp_possible_moved(self, origin):
+        return self.__last_possibly_moved.get(origin, None)

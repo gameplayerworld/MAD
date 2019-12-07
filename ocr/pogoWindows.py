@@ -11,10 +11,10 @@ import numpy as np
 import pytesseract
 from pytesseract import Output
 from PIL import Image
-# from numpy import round, ones, uint8
-# from tinynumpy import tinynumpy as np
+
 from utils.logging import logger
 from ocr.matching_trash import trash_image_matching
+
 Coordinate = collections.namedtuple("Coordinate", ['x', 'y'])
 Bounds = collections.namedtuple("Bounds", ['top', 'bottom', 'left', 'right'])
 
@@ -28,10 +28,33 @@ class PogoWindows:
         self.temp_dir_path = temp_dir_path
         self.__thread_pool = ThreadPool(processes=thread_count)
 
+        # screendetection
+
+        self._ScreenType: dict = {}
+
+        self._ScreenType[2]: list = ['ZURUCKKEHRENDER', 'ZURÜCKKEHRENDER', 'GAME', 'FREAK', 'SPIELER']
+        self._ScreenType[3]: list = ['KIDS', 'Google', 'Facebook']
+        self._ScreenType[4]: list = ['Benutzername', 'Passwort', 'Username', 'Password', 'DRESSEURS']
+        self._ScreenType[5]: list = ['TRY', 'DIFFERENT', 'ACCOUNT', 'Anmeldung', 'Konto', 'anderes',
+                                           'connexion.', 'connexion']
+        self._ScreenType[6]: list = ['Authentifizierung', 'fehlgeschlagen', 'Unable', 'authenticate',
+                                           'Authentification', 'Essaye']
+        self._ScreenType[7]: list = ['incorrect.', 'attempts', 'falsch.', 'gesperrt']
+        self._ScreenType[1]: list = ['Geburtdatum', 'birth.', 'naissance.', 'date']
+        self._ScreenType[12]: list = ['Events,', 'Benachrichtigungen', 'Einstellungen', 'events,', 'offers,',
+                                  'notifications', 'évenements,', 'evenements,', 'offres']
+        self._ScreenType[8]: list = ['Spieldaten', 'abgerufen', 'lecture', 'depuis', 'server', 'data']
+        self._ScreenType[14]: list = ['kompatibel', 'compatible', 'OS', 'software', 'device', 'Gerät', 'Betriebssystem',
+                           'logiciel']
+        self._ScreenType[15]: list = ['continuer...', 'aktualisieren?', 'now?', 'Aktualisieren', 'Aktualisieren,',
+                                    'aktualisieren', 'update', 'continue...', 'Veux-tu', 'Fais', 'continuer']
+        self._ScreenType[21]: list = ['GPS', 'signal', 'GPS-Signal', '(11)', 'introuvable.',
+                                      'found.', 'gefunden.', 'Signal']
+
     def __most_present_colour(self, filename, max_colours):
-        img = Image.open(filename)
-        # put a higher value if there are many colors in your image
-        colors = img.getcolors(max_colours)
+        with Image.open(filename) as img:
+            # put a higher value if there are many colors in your image
+            colors = img.getcolors(max_colours)
         max_occurrence, most_present = 0, 0
         try:
             for c in colors:
@@ -72,8 +95,8 @@ class PogoWindows:
         tempPathColoured = self.temp_dir_path + "/" + str(identifier) + "_gpsError.png"
         cv2.imwrite(tempPathColoured, gpsError)
 
-        col = Image.open(tempPathColoured)
-        width, height = col.size
+        with Image.open(tempPathColoured) as col:
+            width, height = col.size
 
         # check for the colour of the GPS error
         if self.__most_present_colour(tempPathColoured, width * height) == (240, 75, 95):
@@ -239,51 +262,15 @@ class PogoWindows:
             "readCircles: Determined screenshot to not contain raidcircles, but a raidcount!")
         return -1
 
-    def look_for_ggl_login(self, filename, communicator):
-        if not os.path.isfile(filename):
-            logger.error("look_for_ggl_login: {} does not exist", str(filename))
-            return False
-
-        return self.__thread_pool.apply_async(self.__internal_look_for_ggl_login,
-                                              (filename, communicator)).get()
-
-    def __internal_look_for_ggl_login(self, filename, communicator):
-        logger.debug("lookForButton: Look for ggl login")
-        try:
-            screenshot_read = cv2.imread(filename)
-        except:
-            logger.error("Screenshot corrupted :(")
-            return False
-
-        if screenshot_read is None:
-            logger.error("Screenshot corrupted :(")
-            return False
-
-        img = cv2.imread(filename)
-
-        d = pytesseract.image_to_data(img, output_type=Output.DICT)
-
-        n_boxes = len(d['level'])
-        for i in range(n_boxes):
-            if '@gmail.com' in (d['text'][i]):
-                (x, y, w, h) = (d['left'][i], d['top'][i], d['width'][i], d['height'][i])
-                click_x, click_y = x + w / 2, y + h / 2
-                logger.info('Found GGL Mail - click on it (' + str(click_x) + ', ' + str(click_y) + ')')
-                communicator.click(click_x, click_y)
-                time.sleep(5)
-                return True
-
-        return False
-
-    def look_for_button(self, filename, ratiomin, ratiomax, communicator):
+    def look_for_button(self, filename, ratiomin, ratiomax, communicator, upper: bool = False):
         if not os.path.isfile(filename):
             logger.error("look_for_button: {} does not exist", str(filename))
             return False
 
         return self.__thread_pool.apply_async(self.__internal_look_for_button,
-                                              (filename, ratiomin, ratiomax, communicator)).get()
+                                              (filename, ratiomin, ratiomax, communicator, upper)).get()
 
-    def __internal_look_for_button(self, filename, ratiomin, ratiomax, communicator):
+    def __internal_look_for_button(self, filename, ratiomin, ratiomax, communicator, upper):
         logger.debug("lookForButton: Reading lines")
         disToMiddleMin = None
         try:
@@ -326,7 +313,7 @@ class PogoWindows:
         _x = 0
         _y = height
         lines = cv2.HoughLinesP(edges, rho=1, theta=math.pi / 180, threshold=70, minLineLength=minLineLength,
-                                maxLineGap=2)
+                                maxLineGap=5)
         if lines is None:
             return False
 
@@ -337,14 +324,31 @@ class PogoWindows:
             line = [line]
             for x1, y1, x2, y2 in line:
 
-                if y1 == y2 and x2 - x1 <= maxLineLength and x2 - x1 >= minLineLength and y1 > (height / 2) \
-                        and (x2-x1)/2 + x1 < width/2+50 and (x2 - x1)/2+x1 > width/2-50:
+                if y1 == y2 and x2 - x1 <= maxLineLength and x2 - x1 >= minLineLength \
+                        and y1 > height / 3 \
+                        and (x2 - x1) / 2 + x1 < width / 2 + 50 and (x2 - x1) / 2 + x1 > width / 2 - 50:
 
                     lineCount += 1
-                    click_y = _last_y + ((y1 - _last_y) / 2)
-                    _last_y = y1
-                    _x1 = x1
-                    _x2 = x2
+                    disToMiddleMin_temp = y1 - (height / 2)
+                    if upper:
+                        if disToMiddleMin is None:
+                            disToMiddleMin = disToMiddleMin_temp
+                            click_y = y1 + 50
+                            _last_y = y1
+                            _x1 = x1
+                            _x2 = x2
+                        else:
+                            if disToMiddleMin_temp < disToMiddleMin:
+                                click_y = _last_y + ((y1 - _last_y) / 2)
+                                _last_y = y1
+                                _x1 = x1
+                                _x2 = x2
+
+                    else:
+                        click_y = _last_y + ((y1 - _last_y) / 2)
+                        _last_y = y1
+                        _x1 = x1
+                        _x2 = x2
 
                     logger.debug("lookForButton: Found Buttonline Nr. " + str(lineCount) + " - Line lenght: " + str(
                         x2 - x1) + "px Coords - X: " + str(x1) + " " + str(x2) + " Y: " + str(y1) + " " + str(y2))
@@ -658,7 +662,8 @@ class PogoWindows:
         # resize image
         gray = cv2.resize(gray, dim, interpolation=cv2.INTER_AREA)
         cv2.imwrite(temp_path_item, gray)
-        text = pytesseract.image_to_string(Image.open(temp_path_item))
+        with Image.open(temp_path_item) as im:
+            text = pytesseract.image_to_string(im)
         return text
 
     def check_pogo_mainscreen(self, filename, identifier):
@@ -749,3 +754,98 @@ class PogoWindows:
         else:
             logger.debug("Could not find close button (X).")
             return False
+
+    def get_screen_text(self, screenshot, identifier):
+        if screenshot is None:
+            logger.error("get_screen_text: image does not exist")
+            return False
+
+        return self.__thread_pool.apply_async(self.__internal_get_screen_text,
+                                              (screenshot, identifier)).get()
+
+    def __internal_get_screen_text(self, screenshot, identifier):
+        returning_dict = []
+        logger.debug(
+            "get_screen_text: Reading screen text - identifier {}", identifier)
+
+        try:
+                returning_dict = pytesseract.image_to_data(screenshot, output_type=Output.DICT, timeout=40,
+                                                           config='--dpi 70')
+        except:
+            logger.error("Tesseract Error for device {}: {}".format(str(identifier), str(returning_dict)))
+            returning_dict = []
+
+        if isinstance(returning_dict, dict):
+            return returning_dict
+        else:
+            return []
+
+    def most_frequent_colour(self, screenshot, identifier):
+        if screenshot is None:
+            logger.error("get_screen_text: image does not exist")
+            return False
+
+        return self.__thread_pool.apply_async(self.__most_frequent_colour_internal,
+                                              (screenshot, identifier)).get()
+
+    def __most_frequent_colour_internal(self, image, identifier):
+        logger.debug(
+            "most_frequent_colour_internal: Reading screen text - identifier {}", identifier)
+        with Image.open(image) as img:
+            w, h = img.size
+            pixels = img.getcolors(w * h)
+            most_frequent_pixel = pixels[0]
+
+            for count, colour in pixels:
+                if count > most_frequent_pixel[0]:
+                    most_frequent_pixel = (count, colour)
+
+            logger.debug("Most frequent pixel on {} screen: {}".format(str(identifier), (most_frequent_pixel[1])))
+
+        return most_frequent_pixel[1]
+
+
+    def screendetection_get_type(self, image, identifier):
+
+        return self.__thread_pool.apply_async(self.__screendetection_get_type_internal,
+                                              (image, identifier)).get()
+
+    def __screendetection_get_type_internal(self, image, identifier):
+        returntype = -1
+        globaldict = {}
+        diff: int = 1
+        logger.debug(
+            "__screendetection_get_type_internal: Detecting screen type - identifier {}", identifier)
+
+        with Image.open(image) as frame_org:
+            width, height = frame_org.size
+
+            logger.debug("Screensize of origin {}: W:{} x H:{}".format(str(identifier), str(width), str(height)))
+
+            if width < 1080:
+                logger.info('Resize screen ...')
+                frame_org = frame_org.resize([int(2 * s) for s in frame_org.size], Image.ANTIALIAS)
+                diff: int = 2
+
+            frame = frame_org.convert('LA')
+            textes = [frame, frame_org]
+
+            for text in textes:
+                globaldict = self.__internal_get_screen_text(text, identifier)
+                logger.debug("Screentext: {}".format(str(globaldict)))
+                if 'text' not in globaldict:
+                    continue
+                n_boxes = len(globaldict['level'])
+                for i in range(n_boxes):
+                    if returntype != -1: break
+                    if len(globaldict['text'][i]) > 3:
+                        for z in self._ScreenType:
+                            if globaldict['top'][i] > height / 4 and \
+                                    globaldict['text'][i] in self._ScreenType[z]:
+                                returntype = z
+                if returntype != -1: break
+
+            frame.close()
+            del textes
+
+        return returntype, globaldict, width, height, diff

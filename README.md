@@ -8,7 +8,7 @@ Map'A'Droid is a scanner for PoGo based on Android devices.
 
 ## Information
 
-* [Website](https://www.maddev.de/) - For general information
+* [Website](https://www.maddev.eu/) - For general information
 * [Discord](https://discord.gg/7TT58jU) - For general support
 * [Github Issues](https://github.com/Map-A-Droid/MAD/issues) - For reporting bugs (not for support!)
 * [Supported Devices](https://github.com/Map-A-Droid/MAD-device-list) - Supported devices by MAD
@@ -19,12 +19,12 @@ Map'A'Droid is a scanner for PoGo based on Android devices.
 ## Requirements
 
 * Python **3.6**
-* MySQL database, with RocketMap or ~~Monocle structure (only until end of August)~~
+* MySQL database, with RocketMap structure
 * Rooted Android device
-* PogoDroid token (only necessary for MITM Mode), obtainable [via Patreon](https://www.patreon.com/user?u=14159560)
+* PogoDroid token, obtainable [via Webshop](https://maddev.eu/shop/)
 * Game running in English, Deutsch or Français (for Quest mode)
 
->MAD is compatible with ~~[this Monocle schema](https://raw.githubusercontent.com/whitewillem/PMSF/master/sql/cleandb.sql) and (only until end of August)~~ [this RocketMap fork](https://github.com/cecpk/OSM-Rocketmap). Please use them or change your database accordingly.
+>MAD is compatible with [this RocketMap fork](https://github.com/cecpk/OSM-Rocketmap).
 
 ## Installation
 

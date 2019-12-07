@@ -1,13 +1,27 @@
 import datetime
 import os
-import platform
 import calendar
 import time
-
-import cv2
+from PIL import Image
 
 with open('madmin/static/vars/template/phone.tpl', 'r') as file:
     phone_template = file.read().replace('\n', '')
+
+
+def generate_mappingjson(mappings_path):
+    import json
+    newfile = {}
+    newfile['areas'] = {"entries": {}, "index": 0}
+    newfile['auth'] = {"entries": {}, "index": 0}
+    newfile['devices'] = {"entries": {}, "index": 0}
+    newfile['walker'] = {"entries": {}, "index": 0}
+    newfile['devicesettings'] = {"entries": {}, "index": 0}
+    newfile['monivlist'] = {"entries": {}, "index": 0}
+    newfile['walkerarea'] = {"entries": {}, "index": 0}
+    newfile['migrated'] = True
+
+    with open(mappings_path, 'w') as outfile:
+        json.dump(newfile, outfile, indent=4, sort_keys=True)
 
 
 def creation_date(path_to_file):
@@ -18,46 +32,24 @@ def generate_path(path):
     return os.path.join(os.path.join(os.path.dirname(__file__), os.pardir, path))
 
 
-def image_resize(image, savepath, width=None, height=None, inter=cv2.INTER_AREA):
-    # initialize the dimensions of the image to be resized and
-    # grab the image size
+def image_resize(image, savepath, width=None, height=None):
+    basewidth = width
     filename = os.path.basename(image)
-    image = cv2.imread(image, 3)
-    (h, w) = image.shape[:2]
+    with Image.open(image) as img:
+        wpercent = (basewidth / float(img.size[0]))
+        hsize = int((float(img.size[1]) * float(wpercent)))
+        img = img.resize((basewidth, hsize), Image.ANTIALIAS)
+        pre, _ = os.path.splitext(filename)
+        img.save(os.path.join(savepath, str(pre) + '.jpg'))
 
-    # if both the width and height are None, then return the
-    # original image
-    if width is None and height is None:
-        return image
-
-    # check to see if the width is None
-    if width is None:
-        # calculate the ratio of the height and construct the
-        # dimensions
-        r = height / float(h)
-        dim = (int(w * r), height)
-
-    # otherwise, the height is None
-    else:
-        # calculate the ratio of the width and construct the
-        # dimensions
-        r = width / float(w)
-        dim = (width, int(h * r))
-
-    # resize the image
-    resized = cv2.resize(image, dim, interpolation=inter)
-    pre, _ = os.path.splitext(filename)
-    cv2.imwrite(os.path.join(savepath, str(pre) + '.jpg'),
-                resized, [int(cv2.IMWRITE_PNG_COMPRESSION), 9])
-
-    # return the resized image
     return True
 
 
 def pngtojpg(image):
     pre, _ = os.path.splitext(image)
-    image = cv2.imread(image, 3)
-    cv2.imwrite(pre + '.jpg', image, [int(cv2.IMWRITE_PNG_COMPRESSION), 9])
+    with Image.open(image) as im:
+        rgb_im = im.convert('RGB')
+        rgb_im.save(pre + '.jpg')
     return True
 
 
